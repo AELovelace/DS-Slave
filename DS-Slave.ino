@@ -259,7 +259,9 @@ static volatile bool gameMode = false;   // declared early: baseStatusColor() (b
 static volatile PeerKind peerKindForced = PEER_UNKNOWN;   // PEER_UNKNOWN = auto-detect
 static volatile bool reportDump = false;                  // "DUMP 1": hex-log every input report
 
-static uint8_t ledMask = 0;
+static volatile uint8_t ledMask = 0;
+static volatile bool capsLockOn = false;
+static volatile bool ledMaskWritePending = false;
 static String uartLine;
 static String consoleLine;
 static String telnetLine;
@@ -803,7 +805,8 @@ static void emitKey(uint8_t key, uint8_t modifiers) {
     if (ctrl && !commanded(modifiers)) {
       writeModifiedControl(uint8_t(c - 'a' + 1), modifiers);
     } else {
-      writeModifiedAscii(shift ? char(toupper(c)) : c, modifiers);
+      // HID semantics: Shift and Caps Lock invert each other for letters.
+      writeModifiedAscii((shift ^ capsLockOn) ? char(toupper(c)) : c, modifiers);
     }
     return;
   }
@@ -860,7 +863,7 @@ static void emitKey(uint8_t key, uint8_t modifiers) {
       if (!writeCtrlPunctuation(c, modifiers)) writeModifiedAscii(c, modifiers);
       break;
     }
-    case 0x39: break;                               // Caps Lock, no byte
+    case 0x39: setCapsLockState(!capsLockOn); break;              // Caps Lock
     case 0x3A: writeModifiedCsiFinal("\x1BOP", 'P', modifiers); break;     // F1
     case 0x3B: writeModifiedCsiFinal("\x1BOQ", 'Q', modifiers); break;     // F2
     case 0x3C: writeModifiedCsiFinal("\x1BOR", 'R', modifiers); break;     // F3
@@ -1630,14 +1633,14 @@ static bool sendPeerOutputReport(Peer &peer, const uint8_t *payload, size_t leng
   return target->writeValue(payload, length, true);
 }
 
-// Lock LEDs go to every connected keyboard -- with two of them the mask is a
-// bridge-wide setting, not one device's, so they should agree.
-static bool sendLedMask(uint8_t mask) {
-  ledMask = mask & 0x1F;
-
+// Writes the supplied snapshot without changing the desired bridge-wide mask.
+// Keeping those separate matters when a notification changes Caps Lock while
+// loop() is still waiting for an earlier LED write to finish.
+static bool writeLedMask(uint8_t mask) {
+  mask &= 0x1F;
   uint8_t written = 0;
   uint8_t attempted = 0;
-  const uint8_t payload[] = {ledMask};
+  const uint8_t payload[] = {mask};
   for (Peer &peer : peers) {
     if (!peer.connected || peer.kind == PEER_GAMEPAD) {
       continue;
@@ -1655,6 +1658,13 @@ static bool sendLedMask(uint8_t mask) {
 
   Serial.printf("LED report written to %u of %u keyboard(s)\r\n", written, attempted);
   return written > 0;
+}
+
+// Lock LEDs go to every connected keyboard -- with two of them the mask is a
+// bridge-wide setting, not one device's, so they should agree.
+static bool sendLedMask(uint8_t mask) {
+  ledMask = mask & 0x1F;
+  return writeLedMask(ledMask);
 }
 
 static const char *bleErrorText(int error) {
@@ -1866,7 +1876,7 @@ static bool configurePeer(Peer &peer) {
   // Lock LEDs are a keyboard thing; a pad has no output report to write them to,
   // and asking for one just logs a failure on every connect.
   if (peer.kind != PEER_GAMEPAD) {
-    sendLedMask(ledMask);
+    writeLedMask(ledMask);
   }
   return true;
 }
@@ -1953,10 +1963,36 @@ static int parseBinaryArg(const String &arg) {
   return -1;
 }
 
+static void setCapsLockState(bool on) {
+  capsLockOn = on;
+  ledMask = (ledMask & ~uint8_t(0x02)) | (on ? uint8_t(0x02) : uint8_t(0x00));
+
+  // emitKey() runs inside NimBLE's notification callback. A responded GATT
+  // write waits for the NimBLE host task, so doing it there deadlocks the task
+  // that must deliver the response. Defer only the LED transaction to loop();
+  // capsLockOn already changes immediately for the next key report.
+  ledMaskWritePending = true;
+}
+
+static void servicePendingLedMaskWrite() {
+  if (!ledMaskWritePending) {
+    return;
+  }
+
+  const uint8_t mask = ledMask;
+  ledMaskWritePending = false;
+  writeLedMask(mask);
+}
+
 static void setLedBit(uint8_t bit, const String &arg) {
   int value = parseBinaryArg(arg);
   if (value < 0) {
     Serial.println("Use 0/1 or ON/OFF");
+    return;
+  }
+
+  if (bit == 0x02) {
+    setCapsLockState(value == 1);
     return;
   }
 
@@ -2580,6 +2616,7 @@ void loop() {
   serviceWiFiAndTelnet();
   pumpUartCommands();
   pumpConsoleCommands();
+  servicePendingLedMaskWrite();
   serviceGamepadRepeat();
   updateStatusLed();
 
