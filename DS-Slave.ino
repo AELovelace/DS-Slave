@@ -1,11 +1,13 @@
 /*
-  DS-Slave: BLE HID keyboard/gamepad to UART bridge for ESP32-S3.
+  DS-Slave: BLE/USB HID keyboard and BLE gamepad to UART bridge for ESP32-S3.
 
   Pins:
     GPIO17 = UART TX to the downstream device
     GPIO18 = UART RX from the downstream device
 
-  ESP32-S3 supports BLE, not Bluetooth Classic. Put a BLE keyboard (or a
+  A standard USB boot keyboard can be connected through the ESP32-S3 native
+  USB-OTG port. ESP32-S3 supports BLE, not Bluetooth Classic. Put a BLE
+  keyboard (or a
   Bluetooth-LE Xbox controller -- Series X|S / model 1914 and later, i.e. the
   ones that pair directly with a phone) in pairing mode and this sketch connects
   to the first device advertising the HID service. Input goes out UART1 as
@@ -31,7 +33,7 @@
 
   The status WS2812 uses FastLED:
     red = nothing connected
-    magenta = keyboard connected
+    magenta = BLE or USB keyboard connected
     orange = gamepad connected (keystroke mode)
     yellow = keyboard and gamepad both connected
     cyan = game mode (button events)
@@ -44,11 +46,23 @@
 #include <NimBLEDevice.h>
 #include <SPIFFS.h>
 #include <WiFi.h>
+#include <usb/usb_host.h>
 
 #include <ctype.h>
 #include <string.h>
 #include <string>
 #include <vector>
+
+// USB host mode owns the ESP32-S3 USB-OTG peripheral. TinyUSB CDC uses the
+// same peripheral, so a wired keyboard is enabled only with Tools > USB Mode >
+// USB-OTG (TinyUSB) and Tools > USB CDC On Boot > Disabled. The hardware
+// USB-Serial/JTAG choice remains available for flashing and diagnostics, but it
+// cannot share the native D-/D+ pins with a host keyboard.
+#if CONFIG_IDF_TARGET_ESP32S3 && ARDUINO_USB_MODE == 0 && ARDUINO_USB_CDC_ON_BOOT == 0
+#define USB_KEYBOARD_HOST_ENABLED 1
+#else
+#define USB_KEYBOARD_HOST_ENABLED 0
+#endif
 
 // These types are declared up here, ahead of everything else, because functions
 // further down return them. The Arduino builder generates prototypes for every
@@ -237,6 +251,8 @@ WiFiClient telnetClient;
 
 // Peer and InputReportRef are defined at the top of the file; see the note there.
 static Peer peers[MAX_PEERS];
+static Peer usbKeyboardPeer;
+static volatile bool usbKeyboardConnected = false;
 
 // True while a connection is being established. Only one can be in flight at a
 // time: the radio can only initiate one, and the scanner has to be stopped while
@@ -288,6 +304,8 @@ static const char *bleErrorText(int error);
 static bool configurePeer(Peer &peer);
 static void rememberPeer(Peer &peer);
 static void releasePeer(Peer &peer);
+static void usbKeyboardHostBegin();
+static void usbKeyboardQueueLedMask(uint8_t mask);
 
 static uint8_t connectedPeerCount() {
   uint8_t count = 0;
@@ -331,6 +349,9 @@ static bool wantMorePeers() {
 }
 
 static bool anyPeerOfKind(PeerKind kind) {
+  if (kind == PEER_KEYBOARD && usbKeyboardConnected) {
+    return true;
+  }
   for (Peer &peer : peers) {
     if (peer.connected && peer.kind == kind) {
       return true;
@@ -952,6 +973,11 @@ static void emitMergedGamepadState() {
     quit = quit || peer.gbQuit;
     menu = menu || peer.gbMenu;
   }
+  if (usbKeyboardConnected) {
+    mask |= usbKeyboardPeer.gbMask;
+    quit = quit || usbKeyboardPeer.gbQuit;
+    menu = menu || usbKeyboardPeer.gbMenu;
+  }
 
   const uint8_t down = mask & ~gamepadPrev;
   const uint8_t up = gamepadPrev & ~mask;
@@ -1013,6 +1039,9 @@ static void applyGameMode(bool on, const char *reason) {
     peer.padPrevKeyButtons = 0;
     peer.padRepeatBit = 0;
   }
+  clearPeerGameState(usbKeyboardPeer);
+  memset(usbKeyboardPeer.lastKeys, 0, sizeof(usbKeyboardPeer.lastKeys));
+  usbKeyboardPeer.f12Prev = false;
 
   if (on != wasOn && wasOn) {
     emitMergedGamepadState();   // every mask is zero now: releases the lot
@@ -1311,6 +1340,9 @@ static void handleGamepadInputReport(Peer &peer, uint8_t reportId, const uint8_t
   padApplyState(peer);
 }
 
+static void dumpInputReport(const Peer &peer, uint8_t reportId,
+                            const uint8_t *data, size_t length);
+
 static void handleKeyboardReport(Peer &peer, const uint8_t *data, size_t length) {
   if (length < 8) {
     return;
@@ -1362,6 +1394,472 @@ static void handleKeyboardReport(Peer &peer, const uint8_t *data, size_t length)
   peer.lastModifiers = modifiers;
   rememberKeys(peer, keys);
 }
+
+//   ---- USB boot-keyboard host ---------------------------------------------
+//
+// This is deliberately a small class driver rather than a second key mapper.
+// USB boot keyboards and BLE boot keyboards use the same eight-byte report, so
+// once the USB interface is claimed every report goes through
+// handleKeyboardReport() above. That keeps terminal modifiers, F12 game mode,
+// lock state, and the Game Boy mapping identical on both transports.
+#if USB_KEYBOARD_HOST_ENABLED
+
+enum UsbKeyboardControlStage : uint8_t {
+  USB_KB_CONTROL_IDLE = 0,
+  USB_KB_CONTROL_SET_PROTOCOL,
+  USB_KB_CONTROL_SET_IDLE,
+  USB_KB_CONTROL_SET_LED,
+};
+
+struct UsbKeyboardHostState {
+  usb_host_client_handle_t client;
+  usb_device_handle_t device;
+  usb_transfer_t *inputTransfer;
+  usb_transfer_t *controlTransfer;
+  uint8_t interfaceNumber;
+  uint8_t alternateSetting;
+  uint8_t inputEndpoint;
+  uint16_t inputMps;
+  volatile bool interfaceClaimed;
+  volatile bool inputInFlight;
+  volatile bool controlInFlight;
+  volatile bool disconnectRequested;
+  volatile UsbKeyboardControlStage controlStage;
+};
+
+static UsbKeyboardHostState usbKeyboardHost = {};
+static volatile bool usbHostLibraryReady = false;
+static volatile bool usbKeyboardLedPending = false;
+static volatile uint8_t usbKeyboardPendingLedMask = 0;
+static portMUX_TYPE usbKeyboardLedMux = portMUX_INITIALIZER_UNLOCKED;
+
+static void usbKeyboardTryCleanup();
+static bool usbKeyboardSubmitInput();
+
+static void usbKeyboardResetPeerState() {
+  clearPeerGameState(usbKeyboardPeer);
+  memset(usbKeyboardPeer.lastKeys, 0, sizeof(usbKeyboardPeer.lastKeys));
+  usbKeyboardPeer.lastModifiers = 0;
+  usbKeyboardPeer.f12Prev = false;
+}
+
+static void usbKeyboardMarkDisconnected() {
+  const bool wasConnected = usbKeyboardConnected;
+  usbKeyboardConnected = false;
+  usbKeyboardResetPeerState();
+  if (wasConnected && gameMode) {
+    emitMergedGamepadState();
+  }
+}
+
+static bool usbKeyboardSubmitControl(UsbKeyboardControlStage stage, uint8_t ledValue = 0) {
+  UsbKeyboardHostState &host = usbKeyboardHost;
+  if (host.device == nullptr || host.controlTransfer == nullptr ||
+      host.controlInFlight || host.disconnectRequested) {
+    return false;
+  }
+
+  usb_setup_packet_t *setup = (usb_setup_packet_t *)host.controlTransfer->data_buffer;
+  setup->bmRequestType = USB_BM_REQUEST_TYPE_DIR_OUT |
+                         USB_BM_REQUEST_TYPE_TYPE_CLASS |
+                         USB_BM_REQUEST_TYPE_RECIP_INTERFACE;
+  setup->wIndex = host.interfaceNumber;
+  setup->wLength = 0;
+
+  if (stage == USB_KB_CONTROL_SET_PROTOCOL) {
+    setup->bRequest = 0x0B;   // HID SET_PROTOCOL
+    setup->wValue = 0;        // boot protocol
+  } else if (stage == USB_KB_CONTROL_SET_IDLE) {
+    setup->bRequest = 0x0A;   // HID SET_IDLE
+    setup->wValue = 0;
+  } else if (stage == USB_KB_CONTROL_SET_LED) {
+    setup->bRequest = 0x09;   // HID SET_REPORT
+    setup->wValue = 0x0200;   // output report, ID 0
+    setup->wLength = 1;
+    host.controlTransfer->data_buffer[USB_SETUP_PACKET_SIZE] = ledValue & 0x1F;
+  } else {
+    return false;
+  }
+
+  host.controlTransfer->device_handle = host.device;
+  host.controlTransfer->bEndpointAddress = 0;
+  host.controlTransfer->num_bytes = USB_SETUP_PACKET_SIZE + setup->wLength;
+  host.controlStage = stage;
+  host.controlInFlight = true;
+  esp_err_t error = usb_host_transfer_submit_control(host.client, host.controlTransfer);
+  if (error != ESP_OK) {
+    host.controlInFlight = false;
+    host.controlStage = USB_KB_CONTROL_IDLE;
+    Serial.printf("USB keyboard control submit failed: %s\r\n", esp_err_to_name(error));
+    return false;
+  }
+  return true;
+}
+
+static void usbKeyboardControlComplete(usb_transfer_t *transfer) {
+  UsbKeyboardHostState &host = usbKeyboardHost;
+  const UsbKeyboardControlStage completedStage = host.controlStage;
+  host.controlInFlight = false;
+  host.controlStage = USB_KB_CONTROL_IDLE;
+
+  if (host.disconnectRequested || transfer->status == USB_TRANSFER_STATUS_NO_DEVICE) {
+    return;
+  }
+
+  if (transfer->status != USB_TRANSFER_STATUS_COMPLETED) {
+    // Some otherwise valid keyboards stall SET_IDLE or SET_PROTOCOL. Boot
+    // reports are still worth trying, so configuration continues.
+    Serial.printf("USB keyboard control request status=%d; continuing\r\n",
+                  int(transfer->status));
+  }
+
+  if (completedStage == USB_KB_CONTROL_SET_PROTOCOL) {
+    if (!usbKeyboardSubmitControl(USB_KB_CONTROL_SET_IDLE)) {
+      usbKeyboardSubmitInput();
+    }
+  } else if (completedStage == USB_KB_CONTROL_SET_IDLE) {
+    usbKeyboardSubmitInput();
+  }
+}
+
+static void usbKeyboardInputComplete(usb_transfer_t *transfer) {
+  UsbKeyboardHostState &host = usbKeyboardHost;
+  host.inputInFlight = false;
+
+  if (host.disconnectRequested || transfer->status == USB_TRANSFER_STATUS_NO_DEVICE) {
+    return;
+  }
+
+  if (transfer->status == USB_TRANSFER_STATUS_COMPLETED) {
+    if (transfer->actual_num_bytes >= 8) {
+      if (reportDump) {
+        dumpInputReport(usbKeyboardPeer, 0, transfer->data_buffer,
+                        transfer->actual_num_bytes);
+      }
+      handleKeyboardReport(usbKeyboardPeer, transfer->data_buffer,
+                           transfer->actual_num_bytes);
+    }
+  } else {
+    Serial.printf("USB keyboard input status=%d; retrying\r\n", int(transfer->status));
+    usb_host_endpoint_clear(host.device, host.inputEndpoint);
+  }
+
+  usbKeyboardSubmitInput();
+}
+
+static bool usbKeyboardSubmitInput() {
+  UsbKeyboardHostState &host = usbKeyboardHost;
+  if (host.device == nullptr || host.inputTransfer == nullptr ||
+      host.inputInFlight || host.disconnectRequested) {
+    return false;
+  }
+
+  host.inputTransfer->device_handle = host.device;
+  host.inputTransfer->bEndpointAddress = host.inputEndpoint;
+  host.inputTransfer->num_bytes = host.inputMps;
+  host.inputInFlight = true;
+  esp_err_t error = usb_host_transfer_submit(host.inputTransfer);
+  if (error != ESP_OK) {
+    host.inputInFlight = false;
+    Serial.printf("USB keyboard input submit failed: %s\r\n", esp_err_to_name(error));
+    return false;
+  }
+
+  if (!usbKeyboardConnected) {
+    usbKeyboardResetPeerState();
+    usbKeyboardPeer.name = "USB keyboard";
+    usbKeyboardPeer.kind = PEER_KEYBOARD;
+    usbKeyboardConnected = true;
+    Serial.println("USB keyboard ready (boot protocol)");
+    usbKeyboardQueueLedMask(ledMask);
+  }
+  return true;
+}
+
+static bool usbKeyboardFindInterface(const usb_config_desc_t *config,
+                                     uint8_t &interfaceNumber,
+                                     uint8_t &alternateSetting,
+                                     uint8_t &inputEndpoint,
+                                     uint16_t &inputMps) {
+  const uint8_t *bytes = config->val;
+  const size_t totalLength = config->wTotalLength;
+  bool bootKeyboardInterface = false;
+
+  for (size_t offset = 0; offset + USB_STANDARD_DESC_SIZE <= totalLength;) {
+    const usb_standard_desc_t *descriptor =
+      (const usb_standard_desc_t *)(bytes + offset);
+    if (descriptor->bLength < USB_STANDARD_DESC_SIZE ||
+        offset + descriptor->bLength > totalLength) {
+      break;
+    }
+
+    if (descriptor->bDescriptorType == USB_B_DESCRIPTOR_TYPE_INTERFACE &&
+        descriptor->bLength >= USB_INTF_DESC_SIZE) {
+      const usb_intf_desc_t *interfaceDescriptor =
+        (const usb_intf_desc_t *)descriptor;
+      bootKeyboardInterface =
+        interfaceDescriptor->bInterfaceClass == 0x03 &&
+        interfaceDescriptor->bInterfaceSubClass == 0x01 &&
+        interfaceDescriptor->bInterfaceProtocol == 0x01;
+      if (bootKeyboardInterface) {
+        interfaceNumber = interfaceDescriptor->bInterfaceNumber;
+        alternateSetting = interfaceDescriptor->bAlternateSetting;
+      }
+    } else if (bootKeyboardInterface &&
+               descriptor->bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT &&
+               descriptor->bLength >= USB_EP_DESC_SIZE) {
+      const usb_ep_desc_t *endpointDescriptor = (const usb_ep_desc_t *)descriptor;
+      const bool input = (endpointDescriptor->bEndpointAddress &
+                          USB_B_ENDPOINT_ADDRESS_EP_DIR_MASK) != 0;
+      const bool interrupt =
+        (endpointDescriptor->bmAttributes & USB_BM_ATTRIBUTES_XFERTYPE_MASK) ==
+        USB_BM_ATTRIBUTES_XFER_INT;
+      if (input && interrupt) {
+        inputEndpoint = endpointDescriptor->bEndpointAddress;
+        inputMps = USB_EP_DESC_GET_MPS(endpointDescriptor);
+        return inputMps >= 8;
+      }
+    }
+
+    offset += descriptor->bLength;
+  }
+  return false;
+}
+
+static void usbKeyboardTryCleanup() {
+  UsbKeyboardHostState &host = usbKeyboardHost;
+  if (!host.disconnectRequested || host.inputInFlight || host.controlInFlight) {
+    return;
+  }
+
+  usbKeyboardMarkDisconnected();
+  if (host.interfaceClaimed && host.device != nullptr) {
+    esp_err_t error = usb_host_interface_release(
+      host.client, host.device, host.interfaceNumber);
+    if (error != ESP_OK) {
+      Serial.printf("USB keyboard interface release failed: %s\r\n",
+                    esp_err_to_name(error));
+    }
+    host.interfaceClaimed = false;
+  }
+  if (host.inputTransfer != nullptr) {
+    usb_host_transfer_free(host.inputTransfer);
+    host.inputTransfer = nullptr;
+  }
+  if (host.controlTransfer != nullptr) {
+    usb_host_transfer_free(host.controlTransfer);
+    host.controlTransfer = nullptr;
+  }
+  if (host.device != nullptr) {
+    esp_err_t error = usb_host_device_close(host.client, host.device);
+    if (error != ESP_OK) {
+      Serial.printf("USB keyboard device close failed: %s\r\n",
+                    esp_err_to_name(error));
+    }
+    host.device = nullptr;
+  }
+
+  host.disconnectRequested = false;
+  host.inputEndpoint = 0;
+  host.inputMps = 0;
+  Serial.println("USB keyboard disconnected");
+}
+
+static void usbKeyboardOpenDevice(uint8_t address) {
+  UsbKeyboardHostState &host = usbKeyboardHost;
+  if (host.device != nullptr) {
+    return;   // one native root port, one keyboard at a time
+  }
+
+  usb_device_handle_t device = nullptr;
+  esp_err_t error = usb_host_device_open(host.client, address, &device);
+  if (error != ESP_OK) {
+    Serial.printf("USB device open failed: %s\r\n", esp_err_to_name(error));
+    return;
+  }
+
+  const usb_config_desc_t *config = nullptr;
+  uint8_t interfaceNumber = 0;
+  uint8_t alternateSetting = 0;
+  uint8_t inputEndpoint = 0;
+  uint16_t inputMps = 0;
+  error = usb_host_get_active_config_descriptor(device, &config);
+  if (error != ESP_OK || config == nullptr ||
+      !usbKeyboardFindInterface(config, interfaceNumber, alternateSetting,
+                                inputEndpoint, inputMps)) {
+    usb_host_device_close(host.client, device);
+    Serial.println("USB device has no boot-keyboard interface; ignored");
+    return;
+  }
+
+  error = usb_host_interface_claim(host.client, device, interfaceNumber,
+                                   alternateSetting);
+  if (error != ESP_OK) {
+    usb_host_device_close(host.client, device);
+    Serial.printf("USB keyboard interface claim failed: %s\r\n", esp_err_to_name(error));
+    return;
+  }
+
+  host.device = device;
+  host.interfaceNumber = interfaceNumber;
+  host.alternateSetting = alternateSetting;
+  host.inputEndpoint = inputEndpoint;
+  host.inputMps = inputMps;
+  host.interfaceClaimed = true;
+  host.disconnectRequested = false;
+
+  error = usb_host_transfer_alloc(inputMps, 0, &host.inputTransfer);
+  if (error == ESP_OK) {
+    error = usb_host_transfer_alloc(USB_SETUP_PACKET_SIZE + 1, 0,
+                                    &host.controlTransfer);
+  }
+  if (error != ESP_OK) {
+    Serial.printf("USB keyboard transfer allocation failed: %s\r\n", esp_err_to_name(error));
+    host.disconnectRequested = true;
+    return;
+  }
+
+  host.inputTransfer->callback = usbKeyboardInputComplete;
+  host.inputTransfer->context = &host;
+  host.controlTransfer->callback = usbKeyboardControlComplete;
+  host.controlTransfer->context = &host;
+
+  const usb_device_desc_t *deviceDescriptor = nullptr;
+  if (usb_host_get_device_descriptor(device, &deviceDescriptor) == ESP_OK &&
+      deviceDescriptor != nullptr) {
+    Serial.printf("USB keyboard found: VID=%04X PID=%04X interface=%u endpoint=0x%02X\r\n",
+                  deviceDescriptor->idVendor, deviceDescriptor->idProduct,
+                  interfaceNumber, inputEndpoint);
+  } else {
+    Serial.printf("USB keyboard found: interface=%u endpoint=0x%02X\r\n",
+                  interfaceNumber, inputEndpoint);
+  }
+
+  if (!usbKeyboardSubmitControl(USB_KB_CONTROL_SET_PROTOCOL)) {
+    usbKeyboardSubmitInput();
+  }
+}
+
+static void usbKeyboardClientEvent(const usb_host_client_event_msg_t *event, void *arg) {
+  (void)arg;
+  if (event->event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
+    usbKeyboardOpenDevice(event->new_dev.address);
+  } else if (event->event == USB_HOST_CLIENT_EVENT_DEV_GONE &&
+             event->dev_gone.dev_hdl == usbKeyboardHost.device) {
+    usbKeyboardHost.disconnectRequested = true;
+    usbKeyboardMarkDisconnected();
+  }
+}
+
+static void usbKeyboardServiceLedRequest() {
+  UsbKeyboardHostState &host = usbKeyboardHost;
+  if (!usbKeyboardConnected || host.controlInFlight || host.disconnectRequested) {
+    return;
+  }
+
+  bool pending;
+  uint8_t mask;
+  portENTER_CRITICAL(&usbKeyboardLedMux);
+  pending = usbKeyboardLedPending;
+  mask = usbKeyboardPendingLedMask;
+  portEXIT_CRITICAL(&usbKeyboardLedMux);
+  if (!pending || !usbKeyboardSubmitControl(USB_KB_CONTROL_SET_LED, mask)) {
+    return;
+  }
+
+  portENTER_CRITICAL(&usbKeyboardLedMux);
+  if (usbKeyboardPendingLedMask == mask) {
+    usbKeyboardLedPending = false;
+  }
+  portEXIT_CRITICAL(&usbKeyboardLedMux);
+}
+
+static void usbHostLibraryTask(void *notifyTask) {
+  usb_host_config_t config = {};
+  config.skip_phy_setup = false;
+  config.root_port_unpowered = false;
+  config.intr_flags = ESP_INTR_FLAG_LEVEL1;
+  esp_err_t error = usb_host_install(&config);
+  usbHostLibraryReady = (error == ESP_OK);
+  xTaskNotifyGive((TaskHandle_t)notifyTask);
+  if (error != ESP_OK) {
+    Serial.printf("USB Host install failed: %s\r\n", esp_err_to_name(error));
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  for (;;) {
+    uint32_t eventFlags = 0;
+    usb_host_lib_handle_events(portMAX_DELAY, &eventFlags);
+  }
+}
+
+static void usbKeyboardClientTask(void *arg) {
+  (void)arg;
+  usb_host_client_config_t config = {};
+  config.is_synchronous = false;
+  config.max_num_event_msg = 5;
+  config.async.client_event_callback = usbKeyboardClientEvent;
+  config.async.callback_arg = nullptr;
+  esp_err_t error = usb_host_client_register(&config, &usbKeyboardHost.client);
+  if (error != ESP_OK) {
+    Serial.printf("USB keyboard client registration failed: %s\r\n", esp_err_to_name(error));
+    vTaskDelete(nullptr);
+    return;
+  }
+
+  Serial.println("USB keyboard host ready; waiting for a boot keyboard");
+  for (;;) {
+    usb_host_client_handle_events(usbKeyboardHost.client, pdMS_TO_TICKS(20));
+    usbKeyboardTryCleanup();
+    usbKeyboardServiceLedRequest();
+    if (usbKeyboardConnected && !usbKeyboardHost.inputInFlight &&
+        !usbKeyboardHost.disconnectRequested) {
+      usbKeyboardSubmitInput();
+    }
+  }
+}
+
+static void usbKeyboardHostBegin() {
+  TaskHandle_t currentTask = xTaskGetCurrentTaskHandle();
+  BaseType_t created = xTaskCreatePinnedToCore(
+    usbHostLibraryTask, "usb-host", 4096, currentTask, 2, nullptr, 0);
+  if (created != pdPASS) {
+    Serial.println("Could not create USB Host library task");
+    return;
+  }
+
+  ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2000));
+  if (!usbHostLibraryReady) {
+    Serial.println("USB keyboard host unavailable");
+    return;
+  }
+
+  created = xTaskCreatePinnedToCore(
+    usbKeyboardClientTask, "usb-keyboard", 6144, nullptr, 3, nullptr, 0);
+  if (created != pdPASS) {
+    Serial.println("Could not create USB keyboard client task");
+  }
+}
+
+static void usbKeyboardQueueLedMask(uint8_t mask) {
+  portENTER_CRITICAL(&usbKeyboardLedMux);
+  usbKeyboardPendingLedMask = mask & 0x1F;
+  usbKeyboardLedPending = true;
+  portEXIT_CRITICAL(&usbKeyboardLedMux);
+}
+
+#else
+
+static void usbKeyboardHostBegin() {
+  Serial.println("USB keyboard host disabled: select USB-OTG mode with USB CDC On Boot disabled");
+}
+
+static void usbKeyboardQueueLedMask(uint8_t mask) {
+  (void)mask;
+}
+
+#endif
 
 static uint8_t reportIdFor(const Peer &peer, NimBLERemoteCharacteristic *characteristic) {
   for (uint8_t i = 0; i < peer.reportCount; i++) {
@@ -1649,6 +2147,11 @@ static bool writeLedMask(uint8_t mask) {
     if (sendPeerOutputReport(peer, payload, sizeof(payload))) {
       written++;
     }
+  }
+  if (usbKeyboardConnected) {
+    attempted++;
+    usbKeyboardQueueLedMask(mask);
+    written++;
   }
 
   if (attempted == 0) {
@@ -2182,6 +2685,8 @@ static void handleCommand(String line, const char *source) {
     Serial.print(connectPending ? "yes" : "no");
     Serial.print(" scan=");
     Serial.print(NimBLEDevice::getScan()->isScanning() ? "active" : "idle");
+    Serial.print(" usbKeyboard=");
+    Serial.print(usbKeyboardConnected ? "connected" : "idle");
     Serial.print(" wifi=");
     Serial.print(WiFi.status() == WL_CONNECTED ? "connected" : "disconnected");
     if (WiFi.status() == WL_CONNECTED) {
@@ -2537,7 +3042,7 @@ static void pumpConsoleCommands() {
 }
 
 static void printCommandHelp() {
-  Serial.println("Commands from USB Serial Monitor, Telnet, or UART1 RX:");
+  Serial.println("Commands from the debug console, Telnet, or UART1 RX:");
   Serial.println("  HELP");
   Serial.println("  STATUS");
   Serial.println("  KEYBOARDS");
@@ -2574,10 +3079,12 @@ void setup() {
 
   delay(200);
   Serial.println();
-  Serial.println("DS-Slave NimBLE keyboard UART bridge");
+  Serial.println("DS-Slave BLE/USB keyboard UART bridge");
   Serial.printf("UART1 TX=%d RX=%d baud=%lu\r\n", UART_TX_PIN, UART_RX_PIN, (unsigned long)UART_BAUD);
   Serial.printf("Serial0 mirror baud=%lu\r\n", (unsigned long)SERIAL0_MIRROR_BAUD);
   Serial.printf("Status WS2812 pin=%d brightness=%u\r\n", STATUS_LED_PIN, STATUS_LED_BRIGHTNESS);
+
+  usbKeyboardHostBegin();
 
   spiffsReady = SPIFFS.begin(true);
   if (spiffsReady) {
@@ -2620,7 +3127,7 @@ void loop() {
   serviceGamepadRepeat();
   updateStatusLed();
 
-  if (connectedPeerCount() == 0 &&
+  if (connectedPeerCount() == 0 && !usbKeyboardConnected &&
       millis() - lastDisconnectedLogAt >= DISCONNECTED_LOG_INTERVAL_MS) {
     lastDisconnectedLogAt = millis();
     Serial.print("Disconnected: scan=");
