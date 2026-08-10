@@ -39,14 +39,26 @@
     cyan = game mode (button events)
     blue 10 ms flash = transmitted serial on GPIO17
     green 10 ms flash = received serial command input
+
+  Optional SSD1306 I2C OLED status display:
+    address = 0x3C
+    SDA/SCL = board defaults unless SLAVE_OLED_SDA_PIN and
+    SLAVE_OLED_SCL_PIN are defined below or in the build flags.
+
+  Optional rotary encoder volume control:
+    GPIO6 = encoder A / CLK
+    GPIO7 = encoder B / DT
+    GPIO5 = encoder push button / SW
 */
 
 #include <Arduino.h>
 #include <FastLED.h>
 #include <NimBLEDevice.h>
 #include <SPIFFS.h>
+#include <Wire.h>
 #include <WiFi.h>
 #include <usb/usb_host.h>
+#include "BoardVariant.h"
 
 #include <ctype.h>
 #include <string.h>
@@ -224,6 +236,7 @@ static constexpr uint32_t SCAN_RESTART_DELAY_MS = 500;
 static constexpr uint32_t SCAN_IDLE_DELAY_MS = 10000;
 static constexpr uint32_t CONNECT_RETRY_DELAY_MS = 1000;
 static constexpr uint32_t DISCONNECTED_LOG_INTERVAL_MS = 5000;
+static constexpr uint32_t STATUS_DISPLAY_REFRESH_MS = 250;
 static constexpr uint8_t STATUS_LED_COUNT = 1;
 static constexpr uint8_t STATUS_LED_BRIGHTNESS = 48;
 static constexpr uint16_t SERIAL_FLASH_MS = 10;
@@ -235,6 +248,44 @@ static constexpr uint32_t PAD_REPEAT_INTERVAL_MS = 110;  // ...and every one aft
 
 #ifndef STATUS_LED_PIN
 #define STATUS_LED_PIN 48
+#endif
+
+#ifndef SLAVE_OLED_ENABLED
+#define SLAVE_OLED_ENABLED 1
+#endif
+
+#if SLAVE_OLED_ENABLED
+#ifndef SLAVE_OLED_ADDRESS
+#define SLAVE_OLED_ADDRESS 0x3C
+#endif
+#ifndef SLAVE_OLED_SDA_PIN
+#define SLAVE_OLED_SDA_PIN 8
+#endif
+#ifndef SLAVE_OLED_SCL_PIN
+#define SLAVE_OLED_SCL_PIN 9
+#endif
+#ifndef SLAVE_OLED_WIDTH
+#define SLAVE_OLED_WIDTH 128
+#endif
+#ifndef SLAVE_OLED_HEIGHT
+#define SLAVE_OLED_HEIGHT 64
+#endif
+#endif
+
+#ifndef SLAVE_ROTARY_ENCODER_ENABLED
+#define SLAVE_ROTARY_ENCODER_ENABLED 1
+#endif
+
+#if SLAVE_ROTARY_ENCODER_ENABLED
+#ifndef SLAVE_ROTARY_A_PIN
+#define SLAVE_ROTARY_A_PIN 6
+#endif
+#ifndef SLAVE_ROTARY_B_PIN
+#define SLAVE_ROTARY_B_PIN 7
+#endif
+#ifndef SLAVE_ROTARY_BUTTON_PIN
+#define SLAVE_ROTARY_BUTTON_PIN 5
+#endif
 #endif
 
 static const NimBLEUUID HID_SERVICE_UUID((uint16_t)0x1812);
@@ -295,6 +346,24 @@ static bool telnetServerRunning = false;
 static uint8_t telnetParserState = 0;
 static uint8_t telnetPendingCommand = 0;
 static bool telnetSawCarriageReturn = false;
+static uint32_t lastStatusDisplayAt = 0;
+static uint32_t lastStatusDisplayHash = 0;
+enum RotarySetting : uint8_t {
+  ROTARY_SETTING_PAIR = 0,
+  ROTARY_SETTING_GAME_MODE,
+  ROTARY_SETTING_RECONNECT,
+  ROTARY_SETTING_EXIT,
+  ROTARY_SETTING_COUNT
+};
+static bool rotarySettingsActive = false;
+static RotarySetting rotarySetting = ROTARY_SETTING_PAIR;
+#if SLAVE_ROTARY_ENCODER_ENABLED
+static uint8_t rotaryEncoderLastState = 0;
+static int8_t rotaryEncoderAccumulator = 0;
+static bool rotaryButtonRawPressed = false;
+static bool rotaryButtonPressed = false;
+static uint32_t rotaryButtonChangedAt = 0;
+#endif
 
 static void startScan();
 static void printCommandHelp();
@@ -306,6 +375,12 @@ static void rememberPeer(Peer &peer);
 static void releasePeer(Peer &peer);
 static void usbKeyboardHostBegin();
 static void usbKeyboardQueueLedMask(uint8_t mask);
+static void applyGameMode(bool on, const char *reason);
+static void statusDisplayBegin();
+static void updateStatusDisplay(bool force);
+static void statusDisplayRefresh();
+static void rotaryEncoderBegin();
+static void serviceRotaryEncoder();
 
 static uint8_t connectedPeerCount() {
   uint8_t count = 0;
@@ -419,6 +494,414 @@ static void updateStatusLed() {
   }
 }
 
+#if SLAVE_OLED_ENABLED
+static constexpr uint8_t STATUS_DISPLAY_WIDTH = SLAVE_OLED_WIDTH;
+static constexpr uint8_t STATUS_DISPLAY_HEIGHT = SLAVE_OLED_HEIGHT;
+static constexpr uint8_t STATUS_DISPLAY_COLUMNS = STATUS_DISPLAY_WIDTH / 6;
+static constexpr uint8_t STATUS_DISPLAY_ROWS = STATUS_DISPLAY_HEIGHT / 8;
+static constexpr size_t STATUS_DISPLAY_BUFFER_SIZE =
+  (size_t(STATUS_DISPLAY_WIDTH) * STATUS_DISPLAY_HEIGHT) / 8;
+static constexpr bool OLED_BLACK = false;
+static constexpr bool OLED_WHITE = true;
+static constexpr bool OLED_RED = true;
+static constexpr bool OLED_GREEN = true;
+static constexpr bool OLED_CYAN = true;
+static constexpr bool OLED_YELLOW = true;
+static constexpr bool OLED_MAGENTA = true;
+static constexpr bool OLED_GRAY = true;
+
+static uint8_t statusDisplayBuffer[STATUS_DISPLAY_BUFFER_SIZE];
+static bool statusDisplayReady = false;
+static uint32_t nextStatusDisplayProbeAt = 0;
+
+// Standard 5x7 terminal font, packed as five vertical columns per ASCII char.
+static const uint8_t STATUS_FONT_5X7[] PROGMEM = {
+  0x00,0x00,0x00,0x00,0x00, 0x00,0x00,0x5F,0x00,0x00, 0x00,0x07,0x00,0x07,0x00, 0x14,0x7F,0x14,0x7F,0x14,
+  0x24,0x2A,0x7F,0x2A,0x12, 0x23,0x13,0x08,0x64,0x62, 0x36,0x49,0x55,0x22,0x50, 0x00,0x05,0x03,0x00,0x00,
+  0x00,0x1C,0x22,0x41,0x00, 0x00,0x41,0x22,0x1C,0x00, 0x14,0x08,0x3E,0x08,0x14, 0x08,0x08,0x3E,0x08,0x08,
+  0x00,0x50,0x30,0x00,0x00, 0x08,0x08,0x08,0x08,0x08, 0x00,0x60,0x60,0x00,0x00, 0x20,0x10,0x08,0x04,0x02,
+  0x3E,0x51,0x49,0x45,0x3E, 0x00,0x42,0x7F,0x40,0x00, 0x42,0x61,0x51,0x49,0x46, 0x21,0x41,0x45,0x4B,0x31,
+  0x18,0x14,0x12,0x7F,0x10, 0x27,0x45,0x45,0x45,0x39, 0x3C,0x4A,0x49,0x49,0x30, 0x01,0x71,0x09,0x05,0x03,
+  0x36,0x49,0x49,0x49,0x36, 0x06,0x49,0x49,0x29,0x1E, 0x00,0x36,0x36,0x00,0x00, 0x00,0x56,0x36,0x00,0x00,
+  0x08,0x14,0x22,0x41,0x00, 0x14,0x14,0x14,0x14,0x14, 0x00,0x41,0x22,0x14,0x08, 0x02,0x01,0x51,0x09,0x06,
+  0x32,0x49,0x79,0x41,0x3E, 0x7E,0x11,0x11,0x11,0x7E, 0x7F,0x49,0x49,0x49,0x36, 0x3E,0x41,0x41,0x41,0x22,
+  0x7F,0x41,0x41,0x22,0x1C, 0x7F,0x49,0x49,0x49,0x41, 0x7F,0x09,0x09,0x09,0x01, 0x3E,0x41,0x49,0x49,0x7A,
+  0x7F,0x08,0x08,0x08,0x7F, 0x00,0x41,0x7F,0x41,0x00, 0x20,0x40,0x41,0x3F,0x01, 0x7F,0x08,0x14,0x22,0x41,
+  0x7F,0x40,0x40,0x40,0x40, 0x7F,0x02,0x0C,0x02,0x7F, 0x7F,0x04,0x08,0x10,0x7F, 0x3E,0x41,0x41,0x41,0x3E,
+  0x7F,0x09,0x09,0x09,0x06, 0x3E,0x41,0x51,0x21,0x5E, 0x7F,0x09,0x19,0x29,0x46, 0x46,0x49,0x49,0x49,0x31,
+  0x01,0x01,0x7F,0x01,0x01, 0x3F,0x40,0x40,0x40,0x3F, 0x1F,0x20,0x40,0x20,0x1F, 0x3F,0x40,0x38,0x40,0x3F,
+  0x63,0x14,0x08,0x14,0x63, 0x07,0x08,0x70,0x08,0x07, 0x61,0x51,0x49,0x45,0x43, 0x00,0x7F,0x41,0x41,0x00,
+  0x02,0x04,0x08,0x10,0x20, 0x00,0x41,0x41,0x7F,0x00, 0x04,0x02,0x01,0x02,0x04, 0x40,0x40,0x40,0x40,0x40,
+  0x00,0x01,0x02,0x04,0x00, 0x20,0x54,0x54,0x54,0x78, 0x7F,0x48,0x44,0x44,0x38, 0x38,0x44,0x44,0x44,0x20,
+  0x38,0x44,0x44,0x48,0x7F, 0x38,0x54,0x54,0x54,0x18, 0x08,0x7E,0x09,0x01,0x02, 0x0C,0x52,0x52,0x52,0x3E,
+  0x7F,0x08,0x04,0x04,0x78, 0x00,0x44,0x7D,0x40,0x00, 0x20,0x40,0x44,0x3D,0x00, 0x7F,0x10,0x28,0x44,0x00,
+  0x00,0x41,0x7F,0x40,0x00, 0x7C,0x04,0x18,0x04,0x78, 0x7C,0x08,0x04,0x04,0x78, 0x38,0x44,0x44,0x44,0x38,
+  0x7C,0x14,0x14,0x14,0x08, 0x08,0x14,0x14,0x18,0x7C, 0x7C,0x08,0x04,0x04,0x08, 0x48,0x54,0x54,0x54,0x20,
+  0x04,0x3F,0x44,0x40,0x20, 0x3C,0x40,0x40,0x20,0x7C, 0x1C,0x20,0x40,0x20,0x1C, 0x3C,0x40,0x30,0x40,0x3C,
+  0x44,0x28,0x10,0x28,0x44, 0x0C,0x50,0x50,0x50,0x3C, 0x44,0x64,0x54,0x4C,0x44, 0x00,0x08,0x36,0x41,0x00,
+  0x00,0x00,0x7F,0x00,0x00, 0x00,0x41,0x36,0x08,0x00, 0x10,0x08,0x08,0x10,0x08, 0x00,0x00,0x00,0x00,0x00
+};
+
+static bool statusDisplayWriteCommand(uint8_t command) {
+  Wire.beginTransmission(SLAVE_OLED_ADDRESS);
+  Wire.write(0x00);
+  Wire.write(command);
+  return Wire.endTransmission() == 0;
+}
+
+static bool statusDisplayWriteCommand(uint8_t command, uint8_t argument) {
+  Wire.beginTransmission(SLAVE_OLED_ADDRESS);
+  Wire.write(0x00);
+  Wire.write(command);
+  Wire.write(argument);
+  return Wire.endTransmission() == 0;
+}
+
+static bool statusDisplayWriteCommand(uint8_t command, uint8_t arg0, uint8_t arg1) {
+  Wire.beginTransmission(SLAVE_OLED_ADDRESS);
+  Wire.write(0x00);
+  Wire.write(command);
+  Wire.write(arg0);
+  Wire.write(arg1);
+  return Wire.endTransmission() == 0;
+}
+
+static void statusDisplayFillRect(
+  uint8_t x,
+  uint8_t y,
+  uint8_t width,
+  uint8_t height,
+  bool color
+) {
+  if (!statusDisplayReady || width == 0 || height == 0) {
+    return;
+  }
+
+  uint16_t xLimit = uint16_t(x) + width;
+  uint16_t yLimit = uint16_t(y) + height;
+  if (xLimit > STATUS_DISPLAY_WIDTH) {
+    xLimit = STATUS_DISPLAY_WIDTH;
+  }
+  if (yLimit > STATUS_DISPLAY_HEIGHT) {
+    yLimit = STATUS_DISPLAY_HEIGHT;
+  }
+  const uint8_t xEnd = uint8_t(xLimit);
+  const uint8_t yEnd = uint8_t(yLimit);
+  for (uint8_t pixelY = y; pixelY < yEnd; pixelY++) {
+    const uint8_t mask = 1 << (pixelY & 0x07);
+    const size_t rowOffset = size_t(pixelY >> 3) * STATUS_DISPLAY_WIDTH;
+    for (uint8_t pixelX = x; pixelX < xEnd; pixelX++) {
+      uint8_t &cell = statusDisplayBuffer[rowOffset + pixelX];
+      if (color) {
+        cell |= mask;
+      } else {
+        cell &= ~mask;
+      }
+    }
+  }
+}
+
+static void statusDisplayDrawChar(uint8_t column, uint8_t row, char ch, bool fg, bool bg) {
+  if (!statusDisplayReady || column >= STATUS_DISPLAY_COLUMNS || row >= STATUS_DISPLAY_ROWS) {
+    return;
+  }
+  if (ch < 32 || ch > 127) {
+    ch = '?';
+  }
+
+  uint8_t glyph[5];
+  const uint16_t offset = uint16_t(ch - 32) * 5;
+  for (uint8_t i = 0; i < 5; i++) {
+    glyph[i] = pgm_read_byte(&STATUS_FONT_5X7[offset + i]);
+  }
+
+  const uint8_t x = column * 6;
+  const uint8_t y = row * 8;
+  for (uint8_t pixelY = 0; pixelY < 8; pixelY++) {
+    for (uint8_t pixelX = 0; pixelX < 6; pixelX++) {
+      const bool lit = pixelX < 5 && pixelY < 7 && (glyph[pixelX] & (1 << pixelY));
+      statusDisplayFillRect(x + pixelX, y + pixelY, 1, 1, lit ? fg : bg);
+    }
+  }
+}
+
+static void statusDisplayDrawLine(uint8_t row, const char *text, bool fg, bool bg) {
+  char padded[STATUS_DISPLAY_COLUMNS + 1];
+  uint8_t i = 0;
+  for (; i < STATUS_DISPLAY_COLUMNS && text[i] != '\0'; i++) {
+    padded[i] = text[i];
+  }
+  for (; i < STATUS_DISPLAY_COLUMNS; i++) {
+    padded[i] = ' ';
+  }
+  padded[STATUS_DISPLAY_COLUMNS] = '\0';
+
+  for (uint8_t column = 0; column < STATUS_DISPLAY_COLUMNS; column++) {
+    statusDisplayDrawChar(column, row, padded[column], fg, bg);
+  }
+}
+
+static bool statusDisplayFlush() {
+  if (!statusDisplayReady) {
+    return false;
+  }
+
+  if (!statusDisplayWriteCommand(0x21, 0, STATUS_DISPLAY_WIDTH - 1) ||
+      !statusDisplayWriteCommand(0x22, 0, (STATUS_DISPLAY_HEIGHT / 8) - 1)) {
+    return false;
+  }
+
+  for (size_t offset = 0; offset < STATUS_DISPLAY_BUFFER_SIZE; offset += 16) {
+    Wire.beginTransmission(SLAVE_OLED_ADDRESS);
+    Wire.write(0x40);
+    for (uint8_t i = 0; i < 16 && offset + i < STATUS_DISPLAY_BUFFER_SIZE; i++) {
+      Wire.write(statusDisplayBuffer[offset + i]);
+    }
+    if (Wire.endTransmission() != 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool statusDisplayInitPanel() {
+  return statusDisplayWriteCommand(0xAE) &&       // display off
+         statusDisplayWriteCommand(0xD5, 0x80) && // clock
+         statusDisplayWriteCommand(0xA8, STATUS_DISPLAY_HEIGHT - 1) &&
+         statusDisplayWriteCommand(0xD3, 0x00) && // display offset
+         statusDisplayWriteCommand(0x40) &&       // start line
+         statusDisplayWriteCommand(0x8D, 0x14) && // charge pump on
+         statusDisplayWriteCommand(0x20, 0x00) && // horizontal memory mode
+         statusDisplayWriteCommand(0xA1) &&       // segment remap
+         statusDisplayWriteCommand(0xC8) &&       // COM scan direction
+         statusDisplayWriteCommand(0xDA, STATUS_DISPLAY_HEIGHT == 64 ? 0x12 : 0x02) &&
+         statusDisplayWriteCommand(0x81, 0xCF) && // contrast
+         statusDisplayWriteCommand(0xD9, 0xF1) && // precharge
+         statusDisplayWriteCommand(0xDB, 0x40) && // VCOM detect
+         statusDisplayWriteCommand(0xA4) &&       // resume RAM display
+         statusDisplayWriteCommand(0xA6) &&       // normal polarity
+         statusDisplayWriteCommand(0x2E) &&       // deactivate scroll
+         statusDisplayWriteCommand(0xAF);         // display on
+}
+
+static char statusDisplayKindChar(PeerKind kind) {
+  if (kind == PEER_KEYBOARD) {
+    return 'K';
+  }
+  if (kind == PEER_GAMEPAD) {
+    return 'G';
+  }
+  return '?';
+}
+
+static void statusDisplayPeerLine(uint8_t slot, char *line, size_t lineSize) {
+  const Peer &peer = peers[slot];
+  if (!peer.inUse) {
+    snprintf(line, lineSize, "P%u -- FREE", slot + 1);
+    return;
+  }
+
+  const char *state = peer.connected ? "OK" : peer.needsConfigure ? "CFG" : "LINK";
+  const char *name = peer.name.length() > 0 ? peer.name.c_str() : "";
+  snprintf(line, lineSize, "P%u %c %-4s %.7s",
+           slot + 1, statusDisplayKindChar(peer.kind), state, name);
+}
+
+static uint32_t statusDisplayHashAdd(uint32_t hash, uint32_t value) {
+  return (hash ^ value) * 16777619UL;
+}
+
+static uint32_t statusDisplayStateHash() {
+  NimBLEScan *scan = NimBLEDevice::getScan();
+  uint32_t hash = 2166136261UL;
+  hash = statusDisplayHashAdd(hash, rotarySettingsActive ? 1 : 0);
+  hash = statusDisplayHashAdd(hash, rotarySetting);
+  hash = statusDisplayHashAdd(hash, pairingMode ? 1 : 0);
+  hash = statusDisplayHashAdd(hash, connectPending ? 1 : 0);
+  hash = statusDisplayHashAdd(hash, shouldScan ? 1 : 0);
+  hash = statusDisplayHashAdd(hash, scan->isScanning() ? 1 : 0);
+  hash = statusDisplayHashAdd(hash, gameMode ? 1 : 0);
+  hash = statusDisplayHashAdd(hash, usbKeyboardConnected ? 1 : 0);
+  hash = statusDisplayHashAdd(hash, connectedPeerCount());
+  hash = statusDisplayHashAdd(hash, claimedPeerCount());
+  hash = statusDisplayHashAdd(hash, savedKeyboardCount);
+  hash = statusDisplayHashAdd(hash, ledMask);
+  hash = statusDisplayHashAdd(hash, WiFi.status());
+  hash = statusDisplayHashAdd(hash, telnetClient && telnetClient.connected() ? 1 : 0);
+  for (Peer &peer : peers) {
+    hash = statusDisplayHashAdd(hash, peer.inUse ? 1 : 0);
+    hash = statusDisplayHashAdd(hash, peer.connected ? 1 : 0);
+    hash = statusDisplayHashAdd(hash, peer.needsConfigure ? 1 : 0);
+    hash = statusDisplayHashAdd(hash, peer.kind);
+    hash = statusDisplayHashAdd(hash, peer.reportCount);
+    hash = statusDisplayHashAdd(hash, peer.name.length());
+    for (uint8_t i = 0; i < 4 && i < peer.name.length(); i++) {
+      hash = statusDisplayHashAdd(hash, uint8_t(peer.name[i]));
+    }
+  }
+  return hash;
+}
+
+static bool statusDisplayProbe(uint8_t attempts) {
+  for (uint8_t i = 0; i < attempts; i++) {
+    Wire.beginTransmission(SLAVE_OLED_ADDRESS);
+    if (Wire.endTransmission() == 0) {
+      return true;
+    }
+    delay(25);
+  }
+  return false;
+}
+
+static void statusDisplayMarkLost() {
+  if (statusDisplayReady) {
+    Serial.println("Status OLED I2C write failed; will retry");
+  }
+  statusDisplayReady = false;
+  nextStatusDisplayProbeAt = millis() + 1000;
+}
+
+static bool statusDisplayStart(bool quiet, uint8_t probeAttempts) {
+  if (SLAVE_OLED_SDA_PIN >= 0 && SLAVE_OLED_SCL_PIN >= 0) {
+    Wire.begin(SLAVE_OLED_SDA_PIN, SLAVE_OLED_SCL_PIN);
+  } else {
+    Wire.begin();
+  }
+  Wire.setClock(400000);
+
+  if (!statusDisplayProbe(probeAttempts)) {
+    statusDisplayReady = false;
+    nextStatusDisplayProbeAt = millis() + 1000;
+    if (!quiet) {
+      Serial.printf("Status OLED SSD1306 not found at I2C address 0x%02X\r\n",
+                    uint8_t(SLAVE_OLED_ADDRESS));
+    }
+    return false;
+  }
+
+  statusDisplayReady = true;
+  if (!statusDisplayInitPanel()) {
+    statusDisplayMarkLost();
+    return false;
+  }
+
+  statusDisplayFillRect(0, 0, STATUS_DISPLAY_WIDTH, STATUS_DISPLAY_HEIGHT, OLED_BLACK);
+  statusDisplayDrawLine(0, "DS-SLAVE", OLED_BLACK, OLED_WHITE);
+  statusDisplayDrawLine(1, "OLED READY", OLED_GREEN, OLED_BLACK);
+  if (!statusDisplayFlush()) {
+    statusDisplayMarkLost();
+    return false;
+  }
+
+  lastStatusDisplayHash = 0;
+  Serial.printf("Status OLED SSD1306 enabled: address=0x%02X SDA=%d SCL=%d\r\n",
+                uint8_t(SLAVE_OLED_ADDRESS), SLAVE_OLED_SDA_PIN, SLAVE_OLED_SCL_PIN);
+  return true;
+}
+
+static void statusDisplayBegin() {
+  statusDisplayStart(false, 8);
+}
+
+static void updateStatusDisplay(bool force) {
+  if (!statusDisplayReady) {
+    const uint32_t now = millis();
+    if (int32_t(now - nextStatusDisplayProbeAt) >= 0) {
+      nextStatusDisplayProbeAt = now + 1000;
+      statusDisplayStart(true, 1);
+    }
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (!force && int32_t(now - lastStatusDisplayAt) < int32_t(STATUS_DISPLAY_REFRESH_MS)) {
+    return;
+  }
+  lastStatusDisplayAt = now;
+
+  const uint32_t hash = statusDisplayStateHash();
+  if (!force && hash == lastStatusDisplayHash) {
+    return;
+  }
+  lastStatusDisplayHash = hash;
+
+  char line[STATUS_DISPLAY_COLUMNS + 1];
+  const bool scanActive = NimBLEDevice::getScan()->isScanning();
+
+  if (!rotarySettingsActive) {
+    statusDisplayDrawLine(0, "VOLUME MODE", OLED_BLACK, OLED_WHITE);
+    snprintf(line, sizeof(line), "PAIR %-3s SCAN %c",
+             pairingMode ? "ON" : "OFF", scanActive ? '*' : '-');
+    statusDisplayDrawLine(1, line, pairingMode ? OLED_YELLOW : OLED_WHITE, OLED_BLACK);
+    snprintf(line, sizeof(line), "BLE %u/%u CLAIM %u",
+             connectedPeerCount(), MAX_PEERS, claimedPeerCount());
+    statusDisplayDrawLine(2, line, connectedPeerCount() > 0 ? OLED_GREEN : OLED_RED, OLED_BLACK);
+    statusDisplayPeerLine(0, line, sizeof(line));
+    statusDisplayDrawLine(3, line, peers[0].connected ? OLED_GREEN : peers[0].inUse ? OLED_YELLOW : OLED_GRAY, OLED_BLACK);
+    statusDisplayPeerLine(1, line, sizeof(line));
+    statusDisplayDrawLine(4, line, peers[1].connected ? OLED_GREEN : peers[1].inUse ? OLED_YELLOW : OLED_GRAY, OLED_BLACK);
+    snprintf(line, sizeof(line), "USB %-3s GAME %s",
+             usbKeyboardConnected ? "ON" : "OFF", gameMode ? "PAD" : "KEY");
+    statusDisplayDrawLine(5, line, usbKeyboardConnected || gameMode ? OLED_CYAN : OLED_WHITE, OLED_BLACK);
+    snprintf(line, sizeof(line), "WIFI %-2s TEL %-2s",
+             WiFi.status() == WL_CONNECTED ? "OK" : "--",
+             (telnetClient && telnetClient.connected()) ? "ON" : "--");
+    statusDisplayDrawLine(6, line, WiFi.status() == WL_CONNECTED ? OLED_GREEN : OLED_GRAY, OLED_BLACK);
+    snprintf(line, sizeof(line), "SAVE %-2u LED %02X", savedKeyboardCount, ledMask);
+    statusDisplayDrawLine(7, line, OLED_MAGENTA, OLED_BLACK);
+  } else {
+    statusDisplayDrawLine(0, "SETTINGS", OLED_BLACK, OLED_WHITE);
+    snprintf(line, sizeof(line), "%c PAIR DEVICE",
+             rotarySetting == ROTARY_SETTING_PAIR ? '>' : ' ');
+    statusDisplayDrawLine(1, line, rotarySetting == ROTARY_SETTING_PAIR ? OLED_BLACK : OLED_WHITE,
+                         rotarySetting == ROTARY_SETTING_PAIR ? OLED_WHITE : OLED_BLACK);
+    snprintf(line, sizeof(line), "%c GAME MODE: %s",
+             rotarySetting == ROTARY_SETTING_GAME_MODE ? '>' : ' ', gameMode ? "ON" : "OFF");
+    statusDisplayDrawLine(2, line, rotarySetting == ROTARY_SETTING_GAME_MODE ? OLED_BLACK : OLED_WHITE,
+                         rotarySetting == ROTARY_SETTING_GAME_MODE ? OLED_WHITE : OLED_BLACK);
+    snprintf(line, sizeof(line), "%c RECONNECT",
+             rotarySetting == ROTARY_SETTING_RECONNECT ? '>' : ' ');
+    statusDisplayDrawLine(3, line, rotarySetting == ROTARY_SETTING_RECONNECT ? OLED_BLACK : OLED_WHITE,
+                         rotarySetting == ROTARY_SETTING_RECONNECT ? OLED_WHITE : OLED_BLACK);
+    snprintf(line, sizeof(line), "%c EXIT",
+             rotarySetting == ROTARY_SETTING_EXIT ? '>' : ' ');
+    statusDisplayDrawLine(4, line, rotarySetting == ROTARY_SETTING_EXIT ? OLED_BLACK : OLED_WHITE,
+                         rotarySetting == ROTARY_SETTING_EXIT ? OLED_WHITE : OLED_BLACK);
+    snprintf(line, sizeof(line), "PAIR %-3s SCAN %c",
+             pairingMode ? "ON" : "OFF", scanActive ? '*' : '-');
+    statusDisplayDrawLine(5, line, pairingMode ? OLED_YELLOW : OLED_GRAY, OLED_BLACK);
+    snprintf(line, sizeof(line), "BLE %u/%u USB %s",
+             connectedPeerCount(), MAX_PEERS, usbKeyboardConnected ? "ON" : "OFF");
+    statusDisplayDrawLine(6, line, connectedPeerCount() > 0 || usbKeyboardConnected ? OLED_GREEN : OLED_GRAY, OLED_BLACK);
+    const char *detail = rotarySetting == ROTARY_SETTING_PAIR ? "ADD BLE HID" :
+                         rotarySetting == ROTARY_SETTING_GAME_MODE ? "TOGGLE INPUT MODE" :
+                         rotarySetting == ROTARY_SETTING_RECONNECT ? "SCAN SAVED DEVICES" :
+                         "NO CHANGES";
+    statusDisplayDrawLine(7, detail, OLED_WHITE, OLED_BLACK);
+  }
+  if (!statusDisplayFlush()) {
+    statusDisplayMarkLost();
+  }
+}
+
+static const char *statusDisplayStateName() {
+  return statusDisplayReady ? "ready" : "missing";
+}
+#else
+static void statusDisplayBegin() {}
+static void updateStatusDisplay(bool force) {
+  (void)force;
+}
+static const char *statusDisplayStateName() {
+  return "disabled";
+}
+#endif
+
+static void statusDisplayRefresh() {
+  lastStatusDisplayHash = 0;
+  updateStatusDisplay(true);
+}
+
 static void linkWrite(uint8_t value) {
   LinkSerial.write(value);
   Serial0.write(value);
@@ -440,6 +923,152 @@ static void linkWrite(const uint8_t *data, size_t length) {
 static void linkWrite(const char *text) {
   linkWrite((const uint8_t *)text, strlen(text));
 }
+
+#if SLAVE_ROTARY_ENCODER_ENABLED
+static constexpr uint8_t LINK_VOLUME_UP = 0xF4;
+static constexpr uint8_t LINK_VOLUME_DOWN = 0xF5;
+static constexpr uint32_t ROTARY_BUTTON_DEBOUNCE_MS = 35;
+
+static uint8_t readRotaryEncoderState() {
+  return (digitalRead(SLAVE_ROTARY_A_PIN) ? 0x02 : 0x00) |
+         (digitalRead(SLAVE_ROTARY_B_PIN) ? 0x01 : 0x00);
+}
+
+static void rotaryEncoderBegin() {
+  pinMode(SLAVE_ROTARY_A_PIN, INPUT_PULLUP);
+  pinMode(SLAVE_ROTARY_B_PIN, INPUT_PULLUP);
+  pinMode(SLAVE_ROTARY_BUTTON_PIN, INPUT_PULLUP);
+  rotaryEncoderLastState = readRotaryEncoderState();
+  rotaryEncoderAccumulator = 0;
+  rotaryButtonRawPressed = digitalRead(SLAVE_ROTARY_BUTTON_PIN) == LOW;
+  rotaryButtonPressed = rotaryButtonRawPressed;
+  rotaryButtonChangedAt = millis();
+  Serial.printf("Volume encoder enabled: A=%d B=%d SW=%d%s\r\n",
+                SLAVE_ROTARY_A_PIN, SLAVE_ROTARY_B_PIN, SLAVE_ROTARY_BUTTON_PIN,
+                SLAVE_ROTARY_REVERSED ? " reversed" : "");
+}
+
+static void rotarySettingsEnter() {
+  rotarySettingsActive = true;
+  rotarySetting = ROTARY_SETTING_PAIR;
+  rotaryEncoderAccumulator = 0;
+  Serial.println("Rotary settings opened");
+  statusDisplayRefresh();
+}
+
+static void rotarySettingsApply() {
+  const RotarySetting selected = rotarySetting;
+  rotarySettingsActive = false;
+  rotaryEncoderAccumulator = 0;
+
+  if (selected == ROTARY_SETTING_PAIR) {
+    NimBLEScan *scan = NimBLEDevice::getScan();
+    if (scan->isScanning()) {
+      scan->stop();
+    }
+    if (claimedPeerCount() >= MAX_PEERS) {
+      Serial.println("All peer slots are in use; pairing was not started");
+    } else {
+      pairingMode = true;
+      shouldScan = true;
+      nextScanAt = millis() + SCAN_RESTART_DELAY_MS;
+      Serial.println("Pairing mode enabled from rotary settings");
+    }
+  } else if (selected == ROTARY_SETTING_GAME_MODE) {
+    applyGameMode(!gameMode, "rotary settings");
+  } else if (selected == ROTARY_SETTING_RECONNECT) {
+    NimBLEScan *scan = NimBLEDevice::getScan();
+    if (scan->isScanning()) {
+      scan->stop();
+    }
+    pairingMode = false;
+    shouldScan = true;
+    nextScanAt = millis() + SCAN_RESTART_DELAY_MS;
+    Serial.println("Reconnect scan requested from rotary settings");
+  } else {
+    Serial.println("Rotary settings closed");
+  }
+
+  statusDisplayRefresh();
+}
+
+static void rotarySettingsMove(int8_t direction) {
+  int8_t next = int8_t(rotarySetting) + direction;
+  if (next < 0) {
+    next = ROTARY_SETTING_COUNT - 1;
+  } else if (next >= ROTARY_SETTING_COUNT) {
+    next = 0;
+  }
+  rotarySetting = RotarySetting(next);
+  statusDisplayRefresh();
+}
+
+static void serviceRotaryButton() {
+  const bool rawPressed = digitalRead(SLAVE_ROTARY_BUTTON_PIN) == LOW;
+  const uint32_t now = millis();
+  if (rawPressed != rotaryButtonRawPressed) {
+    rotaryButtonRawPressed = rawPressed;
+    rotaryButtonChangedAt = now;
+  }
+
+  if (rawPressed != rotaryButtonPressed &&
+      uint32_t(now - rotaryButtonChangedAt) >= ROTARY_BUTTON_DEBOUNCE_MS) {
+    rotaryButtonPressed = rawPressed;
+    if (rotaryButtonPressed) {
+      if (rotarySettingsActive) {
+        rotarySettingsApply();
+      } else {
+        rotarySettingsEnter();
+      }
+    }
+  }
+}
+
+static void serviceRotaryEncoder() {
+  static const int8_t transitions[16] = {
+     0, -1,  1,  0,
+     1,  0,  0, -1,
+    -1,  0,  0,  1,
+     0,  1, -1,  0
+  };
+
+  serviceRotaryButton();
+
+  const uint8_t state = readRotaryEncoderState();
+  if (state == rotaryEncoderLastState) {
+    return;
+  }
+
+  int8_t delta = transitions[(rotaryEncoderLastState << 2) | state];
+  rotaryEncoderLastState = state;
+  if (delta == 0) {
+    return;
+  }
+  if (SLAVE_ROTARY_REVERSED) {
+    delta = -delta;
+  }
+
+  rotaryEncoderAccumulator += delta;
+  if (rotaryEncoderAccumulator >= 4) {
+    rotaryEncoderAccumulator = 0;
+    if (rotarySettingsActive) {
+      rotarySettingsMove(1);
+    } else {
+      linkWrite(LINK_VOLUME_UP);
+    }
+  } else if (rotaryEncoderAccumulator <= -4) {
+    rotaryEncoderAccumulator = 0;
+    if (rotarySettingsActive) {
+      rotarySettingsMove(-1);
+    } else {
+      linkWrite(LINK_VOLUME_DOWN);
+    }
+  }
+}
+#else
+static void rotaryEncoderBegin() {}
+static void serviceRotaryEncoder() {}
+#endif
 
 static bool keyWasDown(const Peer &peer, uint8_t key) {
   for (uint8_t i = 0; i < sizeof(peer.lastKeys); i++) {
@@ -2687,6 +3316,20 @@ static void handleCommand(String line, const char *source) {
     Serial.print(NimBLEDevice::getScan()->isScanning() ? "active" : "idle");
     Serial.print(" usbKeyboard=");
     Serial.print(usbKeyboardConnected ? "connected" : "idle");
+    Serial.print(" oled=");
+    Serial.print(statusDisplayStateName());
+    Serial.print(" screen=");
+    Serial.print(rotarySettingsActive ? "settings" : "volume");
+    Serial.print(" encoder=");
+#if SLAVE_ROTARY_ENCODER_ENABLED
+    Serial.print(SLAVE_ROTARY_A_PIN);
+    Serial.print("/");
+    Serial.print(SLAVE_ROTARY_B_PIN);
+    Serial.print(" button=");
+    Serial.print(SLAVE_ROTARY_BUTTON_PIN);
+#else
+    Serial.print("disabled");
+#endif
     Serial.print(" wifi=");
     Serial.print(WiFi.status() == WL_CONNECTED ? "connected" : "disconnected");
     if (WiFi.status() == WL_CONNECTED) {
@@ -3083,6 +3726,8 @@ void setup() {
   Serial.printf("UART1 TX=%d RX=%d baud=%lu\r\n", UART_TX_PIN, UART_RX_PIN, (unsigned long)UART_BAUD);
   Serial.printf("Serial0 mirror baud=%lu\r\n", (unsigned long)SERIAL0_MIRROR_BAUD);
   Serial.printf("Status WS2812 pin=%d brightness=%u\r\n", STATUS_LED_PIN, STATUS_LED_BRIGHTNESS);
+  rotaryEncoderBegin();
+  statusDisplayBegin();
 
   usbKeyboardHostBegin();
 
@@ -3102,10 +3747,10 @@ void setup() {
   NimBLEDevice::setOwnAddrType(BLE_OWN_ADDR_PUBLIC);
   NimBLEDevice::setPower(3);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
-  // Bond, no MITM (we have no display or keypad to show a passkey on), and offer
-  // LE Secure Connections: Xbox controllers pair with SC and refuse to hand over
-  // input reports without it. Keyboards that only do legacy pairing negotiate
-  // down to it, so asking for SC costs them nothing.
+  // Bond, no MITM: the status OLED is read-only and there is no passkey/confirm
+  // input path. Offer LE Secure Connections; Xbox controllers pair with SC and
+  // refuse to hand over input reports without it. Keyboards that only do legacy
+  // pairing negotiate down to it, so asking for SC costs them nothing.
   NimBLEDevice::setSecurityAuth(BLE_SM_PAIR_AUTHREQ_BOND | BLE_SM_PAIR_AUTHREQ_SC);
   NimBLEDevice::setSecurityInitKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
   NimBLEDevice::setSecurityRespKey(BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID);
@@ -3125,7 +3770,9 @@ void loop() {
   pumpConsoleCommands();
   servicePendingLedMaskWrite();
   serviceGamepadRepeat();
+  serviceRotaryEncoder();
   updateStatusLed();
+  updateStatusDisplay(false);
 
   if (connectedPeerCount() == 0 && !usbKeyboardConnected &&
       millis() - lastDisconnectedLogAt >= DISCONNECTED_LOG_INTERVAL_MS) {
