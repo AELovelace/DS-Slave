@@ -68,7 +68,7 @@ out-of-band volume nudges to DOLL-OS. Wire the encoder common pin to `GND`, then
 Connect the encoder's common pin and the other side of the push button to
 `GND`. The sketch enables internal pullups on all three inputs. Press the encoder
 once to open Settings, rotate it to highlight Pair Device, Game Mode, Reconnect,
-or Exit, then press again to apply that choice and return to volume control. Set
+Sleep, or Exit, then press again to apply that choice and return to volume control. Set
 `SLAVE_ROTARY_REVERSED` in `BoardVariant.h` to `1` if clockwise turns the volume down.
 
 ```cpp
@@ -78,3 +78,26 @@ or Exit, then press again to apply that choice and return to volume control. Set
 ```
 
 Set `SLAVE_ROTARY_ENCODER_ENABLED` to `0` if the encoder is not installed.
+
+## Paired sleep mode
+
+Choosing **Sleep** sends the private `0xF6` control byte to DOLL-OS, waits until
+the selecting button press is released, switches off the slave OLED and status
+LED, stops Wi-Fi, and places the slave ESP32-S3 in deep sleep. GPIO5 is the
+active-low deep-sleep wake source.
+
+Press the rotary dial once to wake. Deep-sleep wake resets and boots the slave;
+early in `setup()` it sends several private `0xF7` wake bytes. The first UART
+start bit wakes the main unit from light sleep and the remaining bytes are
+discarded as controls. The slave holds GPIO17 high while asleep so the main
+unit's RX wake input cannot float low.
+
+Bench test the pair after flashing both boards:
+
+1. Open the slave Settings menu and select **Sleep**.
+2. Confirm both displays and both status LEDs turn off.
+3. Wait several seconds and press, then release, the rotary dial once.
+4. Confirm the slave boot banner returns and the main TFT immediately restores
+   its prior frame; Wi-Fi may take a few more seconds to reassociate.
+5. Confirm rotating the dial changes volume and a second button press opens
+   Settings, proving the wake press was not reused as menu input.

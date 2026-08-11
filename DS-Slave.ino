@@ -58,6 +58,9 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <usb/usb_host.h>
+#include <driver/gpio.h>
+#include <driver/rtc_io.h>
+#include <esp_sleep.h>
 #include "BoardVariant.h"
 
 #include <ctype.h>
@@ -352,6 +355,7 @@ enum RotarySetting : uint8_t {
   ROTARY_SETTING_PAIR = 0,
   ROTARY_SETTING_GAME_MODE,
   ROTARY_SETTING_RECONNECT,
+  ROTARY_SETTING_SLEEP,
   ROTARY_SETTING_EXIT,
   ROTARY_SETTING_COUNT
 };
@@ -379,6 +383,7 @@ static void applyGameMode(bool on, const char *reason);
 static void statusDisplayBegin();
 static void updateStatusDisplay(bool force);
 static void statusDisplayRefresh();
+static void statusDisplayPowerOff();
 static void rotaryEncoderBegin();
 static void serviceRotaryEncoder();
 
@@ -863,19 +868,21 @@ static void updateStatusDisplay(bool force) {
              rotarySetting == ROTARY_SETTING_RECONNECT ? '>' : ' ');
     statusDisplayDrawLine(3, line, rotarySetting == ROTARY_SETTING_RECONNECT ? OLED_BLACK : OLED_WHITE,
                          rotarySetting == ROTARY_SETTING_RECONNECT ? OLED_WHITE : OLED_BLACK);
+    snprintf(line, sizeof(line), "%c SLEEP",
+             rotarySetting == ROTARY_SETTING_SLEEP ? '>' : ' ');
+    statusDisplayDrawLine(4, line, rotarySetting == ROTARY_SETTING_SLEEP ? OLED_BLACK : OLED_WHITE,
+                         rotarySetting == ROTARY_SETTING_SLEEP ? OLED_WHITE : OLED_BLACK);
     snprintf(line, sizeof(line), "%c EXIT",
              rotarySetting == ROTARY_SETTING_EXIT ? '>' : ' ');
-    statusDisplayDrawLine(4, line, rotarySetting == ROTARY_SETTING_EXIT ? OLED_BLACK : OLED_WHITE,
+    statusDisplayDrawLine(5, line, rotarySetting == ROTARY_SETTING_EXIT ? OLED_BLACK : OLED_WHITE,
                          rotarySetting == ROTARY_SETTING_EXIT ? OLED_WHITE : OLED_BLACK);
-    snprintf(line, sizeof(line), "PAIR %-3s SCAN %c",
-             pairingMode ? "ON" : "OFF", scanActive ? '*' : '-');
-    statusDisplayDrawLine(5, line, pairingMode ? OLED_YELLOW : OLED_GRAY, OLED_BLACK);
     snprintf(line, sizeof(line), "BLE %u/%u USB %s",
              connectedPeerCount(), MAX_PEERS, usbKeyboardConnected ? "ON" : "OFF");
     statusDisplayDrawLine(6, line, connectedPeerCount() > 0 || usbKeyboardConnected ? OLED_GREEN : OLED_GRAY, OLED_BLACK);
     const char *detail = rotarySetting == ROTARY_SETTING_PAIR ? "ADD BLE HID" :
                          rotarySetting == ROTARY_SETTING_GAME_MODE ? "TOGGLE INPUT MODE" :
                          rotarySetting == ROTARY_SETTING_RECONNECT ? "SCAN SAVED DEVICES" :
+                         rotarySetting == ROTARY_SETTING_SLEEP ? "LOW POWER MODE" :
                          "NO CHANGES";
     statusDisplayDrawLine(7, detail, OLED_WHITE, OLED_BLACK);
   }
@@ -887,6 +894,12 @@ static void updateStatusDisplay(bool force) {
 static const char *statusDisplayStateName() {
   return statusDisplayReady ? "ready" : "missing";
 }
+
+static void statusDisplayPowerOff() {
+  if (statusDisplayReady) {
+    statusDisplayWriteCommand(0xAE);  // SSD1306 display-off keeps the OLED dark in deep sleep.
+  }
+}
 #else
 static void statusDisplayBegin() {}
 static void updateStatusDisplay(bool force) {
@@ -895,6 +908,7 @@ static void updateStatusDisplay(bool force) {
 static const char *statusDisplayStateName() {
   return "disabled";
 }
+static void statusDisplayPowerOff() {}
 #endif
 
 static void statusDisplayRefresh() {
@@ -924,10 +938,59 @@ static void linkWrite(const char *text) {
   linkWrite((const uint8_t *)text, strlen(text));
 }
 
+static constexpr uint8_t LINK_SYSTEM_SLEEP = 0xF6;
+static constexpr uint8_t LINK_SYSTEM_WAKE = 0xF7;
+
+static void sendMainWakeBeacon() {
+  // Several bytes cover the main unit's light-sleep wake latency; all are private controls.
+  for (uint8_t i = 0; i < 8; i++) {
+    LinkSerial.write(LINK_SYSTEM_WAKE);
+    LinkSerial.flush();
+    delay(4);
+  }
+}
+
 #if SLAVE_ROTARY_ENCODER_ENABLED
 static constexpr uint8_t LINK_VOLUME_UP = 0xF4;
 static constexpr uint8_t LINK_VOLUME_DOWN = 0xF5;
 static constexpr uint32_t ROTARY_BUTTON_DEBOUNCE_MS = 35;
+
+static bool enterSlaveDeepSleep() {
+  const gpio_num_t wakePin = gpio_num_t(SLAVE_ROTARY_BUTTON_PIN);
+  const esp_err_t wakeResult = esp_sleep_enable_ext0_wakeup(wakePin, 0);
+  if (wakeResult != ESP_OK) {
+    Serial.printf("Sleep rejected: GPIO%d cannot wake from deep sleep (error %d)\r\n",
+                  SLAVE_ROTARY_BUTTON_PIN, int(wakeResult));
+    return false;
+  }
+
+  linkWrite(LINK_SYSTEM_SLEEP);  // Tell DOLL-OS to darken its panel and enter light sleep.
+  LinkSerial.flush();
+  Serial0.flush();
+  Serial.println("Sleep requested; release the rotary button, then press it to wake");
+
+  // The selecting press is still down here; sleeping before release would wake immediately.
+  while (digitalRead(SLAVE_ROTARY_BUTTON_PIN) == LOW) {
+    delay(10);
+  }
+  delay(ROTARY_BUTTON_DEBOUNCE_MS);
+
+  rtc_gpio_pullup_en(wakePin);     // Keep the active-low rotary switch biased while asleep.
+  rtc_gpio_pulldown_dis(wakePin);
+  statusDisplayPowerOff();         // Shut down the secondary OLED before power domains fall.
+  FastLED.clear(true);             // Leave the status pixel physically dark during deep sleep.
+  WiFi.disconnect(true, false);    // Stop the slave radio cleanly before deep sleep powers it down.
+  WiFi.mode(WIFI_OFF);
+
+  // The flushed UART is idle-high; hold that pad state so the main RX cannot float and false-trigger.
+  delay(1);
+  gpio_hold_en(gpio_num_t(UART_TX_PIN));
+  gpio_deep_sleep_hold_en();
+
+  Serial.flush();
+  esp_deep_sleep_start();          // Deep-sleep wake performs the requested full slave restart.
+  return true;                     // Unreachable, but keeps the failure-capable API explicit.
+}
 
 static uint8_t readRotaryEncoderState() {
   return (digitalRead(SLAVE_ROTARY_A_PIN) ? 0x02 : 0x00) |
@@ -985,6 +1048,10 @@ static void rotarySettingsApply() {
     shouldScan = true;
     nextScanAt = millis() + SCAN_RESTART_DELAY_MS;
     Serial.println("Reconnect scan requested from rotary settings");
+  } else if (selected == ROTARY_SETTING_SLEEP) {
+    if (!enterSlaveDeepSleep()) {
+      rotarySettingsActive = true;  // Leave the failed choice visible so the hardware error is clear.
+    }
   } else {
     Serial.println("Rotary settings closed");
   }
@@ -3715,7 +3782,10 @@ static void printCommandHelp() {
 void setup() {
   Serial.begin(USB_BAUD);
   Serial0.begin(SERIAL0_MIRROR_BAUD);
+  gpio_deep_sleep_hold_dis();             // Release the UART idle-high hold left by deep sleep.
+  gpio_hold_dis(gpio_num_t(UART_TX_PIN));
   LinkSerial.begin(UART_BAUD, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+  sendMainWakeBeacon();                    // Wake DOLL-OS after any slave reset, including rotary wake.
   FastLED.addLeds<WS2812, STATUS_LED_PIN, GRB>(statusLed, STATUS_LED_COUNT);
   FastLED.setBrightness(STATUS_LED_BRIGHTNESS);
   setStatusColor(baseStatusColor());
