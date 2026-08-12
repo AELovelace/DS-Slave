@@ -42,13 +42,15 @@
 
   Optional SSD1306 I2C OLED status display:
     address = 0x3C
-    SDA/SCL = board defaults unless SLAVE_OLED_SDA_PIN and
-    SLAVE_OLED_SCL_PIN are defined below or in the build flags.
+    GND = power/signal ground
+    VCC/VDD/VIN = 3V3 power (never 5 V)
+    SDA/DAT/DIN = GPIO8 I2C serial data
+    SCL/SCK/CLK = GPIO9 I2C serial clock
 
   Optional rotary encoder volume control:
-    GPIO6 = encoder A / CLK
-    GPIO7 = encoder B / DT
-    GPIO5 = encoder push button / SW
+    GPIO5 = encoder shaft push-button signal / SW
+    GPIO6 = encoder rotation clock / channel A / CLK
+    GPIO7 = encoder rotation data / channel B / DT
 */
 
 #include <Arduino.h>
@@ -281,13 +283,13 @@ static constexpr uint32_t PAD_REPEAT_INTERVAL_MS = 110;  // ...and every one aft
 
 #if SLAVE_ROTARY_ENCODER_ENABLED
 #ifndef SLAVE_ROTARY_A_PIN
-#define SLAVE_ROTARY_A_PIN 6
+#define SLAVE_ROTARY_A_PIN 6       // Encoder CLK / quadrature channel A.
 #endif
 #ifndef SLAVE_ROTARY_B_PIN
-#define SLAVE_ROTARY_B_PIN 7
+#define SLAVE_ROTARY_B_PIN 7       // Encoder DT / quadrature channel B.
 #endif
 #ifndef SLAVE_ROTARY_BUTTON_PIN
-#define SLAVE_ROTARY_BUTTON_PIN 5
+#define SLAVE_ROTARY_BUTTON_PIN 5  // Encoder SW / shaft push-button signal.
 #endif
 #endif
 
