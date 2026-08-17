@@ -61,11 +61,18 @@ meter because physical terminal layouts can vary.
 
 Connect the encoder's common pin and the other side of the push button to
 `GND`. The sketch enables internal pullups on all three inputs. Press the encoder
-once to open Settings, rotate it to highlight Pair Device, Game Mode, Reconnect,
-Sleep, or Exit, then press again to apply that choice and return to volume control. Set
-`SLAVE_ROTARY_REVERSED` in `BoardVariant.h` to `1` if clockwise turns the volume down.
+once to open Settings, rotate it to highlight Pair Device, Game Mode, Terminate
+App, Reconnect, Sleep, or Exit, then press again to apply that choice and return to
+volume control. Set `SLAVE_ROTARY_REVERSED` in `BoardVariant.h` to `1` if clockwise
+turns the volume down.
 
-The [complete Settings guide](https://github.com/AELovelace/Doll-OS-FNK0104/blob/main/SETTINGS_GUIDE.md)
+**Terminate App** closes whatever app owns the DOLL-OS panel and drops it back to
+the shell, which is the only way out of a game or a stuck `.dapp` on a build with
+no keyboard attached. It sends DOLL-OS's two abort chords, `^X` then Ctrl+T, because
+different apps honour different ones; with nothing running both are discarded at
+the prompt.
+
+The [complete Settings guide](https://github.com/AELovelace/Doll-OS-FNK0104/blob/main/docs/SETTINGS_GUIDE.md)
 documents every persistent DOLL-OS key and every rotary menu action.
 
 ```cpp
@@ -121,9 +128,15 @@ Three momentary switches on a shared rail cover the Game Boy buttons the
 joystick does not. Wire the bar's common rail to `3V3` and each switch to its
 own pin:
 
-- left button -> `GPIO10` -> **A**
+- left button -> `GPIO10` -> **Start**
 - middle button -> `GPIO11` -> **B**
-- right button -> `GPIO12` -> **Start**
+- right button -> `GPIO12` -> **A**
+
+B sits left of A the way a Game Boy's face buttons do, with Start on the outside, and
+the pins ascend across the bar so it can be wired straight through. If next and
+previous station (or track) come out swapped, A and Start are crossed — fix the loom
+or swap those two pin numbers. Nothing on the DOLL-OS side needs touching; it only
+ever sees the button names.
 
 Nothing else is needed; the sketch holds the three pins low with internal
 pulldowns, so a press is the switch closing 3V3 onto the pin. If your bar is
@@ -133,15 +146,38 @@ the console prints the raw pin levels next to the decoded press state, which is
 the quickest way to tell which one you have.
 
 ```cpp
-#define SLAVE_BUTTON_A_PIN 10      // Game Boy A
-#define SLAVE_BUTTON_B_PIN 11      // Game Boy B
-#define SLAVE_BUTTON_C_PIN 12      // Game Boy Start
+#define SLAVE_BUTTON_C_PIN 10      // Game Boy Start, left
+#define SLAVE_BUTTON_B_PIN 11      // Game Boy B, middle
+#define SLAVE_BUTTON_A_PIN 12      // Game Boy A, right
 ```
 
-In game mode the three are the real A, B, and Start. Outside it they send what
-the controller's matching buttons send: Enter, Escape, and Enter. They merge
-with the joystick, the keyboard, and a paired controller rather than replacing
-them, so a stick direction and a button held together come through as a chord.
+In game mode the three are the real Start, B, and A. They merge with the joystick,
+the keyboard, and a paired controller rather than replacing them, so a stick
+direction and a button held together come through as a chord.
+
+Outside game mode the bar is the only input that does not send keystrokes. Each
+press sends one private byte — `0xF8` Start, `0xFA` B, `0xFB` A — and DOLL-OS reads
+it against whatever is currently using its audio and screen:
+
+| What's running on the DS | Start (left) | B (middle) | A (right) |
+|---|---|---|---|
+| Music player open, or a library track playing | previous track | pause / resume | next track |
+| A radio stream loaded | previous station | stop | next station |
+| Nothing playing — plain shell | launch `gb` | launch `radio play` | launch `music` |
+
+The middle button stops the radio rather than pausing it, because a paused stream still
+owns the bar and would leave the `gb` and `music` launchers unreachable. Stopping
+releases it, so B toggles the radio on and off.
+
+Nothing is sent on release and nothing auto-repeats: every action on the far end is
+a one-shot, so a held button is the same event as a tapped one. A paired controller
+keeps sending Enter/Escape from its A/B — it is a general navigation device, and the
+joystick's click still sends Escape — so only the bar changed. `0xF9` is reserved for
+a fourth switch wired as Select; add it to `buttonBarKeys` and it works, but DOLL-OS
+has no action bound to it yet.
+
+These bytes are a paired protocol change: flash both boards together, and see
+`PadButtons.ino` plus §14 of `docs/api-guide.md` on the DOLL-OS side.
 
 Set `SLAVE_BUTTON_BAR_ENABLED` to `0` if the bar is not installed.
 

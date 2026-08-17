@@ -63,10 +63,16 @@
   D-pad button events in game mode. Clicking the stick is Select (Escape when
   not in game mode), the same as the pad's View button.
 
-  Optional three-button bar, common rail to 3V3, one switch per pin:
-    GPIO10 = A     (Enter when not in game mode)
-    GPIO11 = B     (Escape)
-    GPIO12 = Start (Enter)
+  Optional three-button bar, common rail to 3V3, one switch per pin. The bar reads
+  Start, B, A from left to right, and the pins ascend in that same order:
+    GPIO10 = Start (left)
+    GPIO11 = B     (middle)
+    GPIO12 = A     (right)
+  In game mode these are the real Game Boy Start/B/A. Outside it they are the
+  only input that does not send keystrokes: each press sends one private byte
+  (0xF8 Start, 0xFA B, 0xFB A) and DOLL-OS reads it against whatever is running --
+  previous/pause/next for the music player and the radio, or gb/radio/music
+  launchers on an idle shell. See PadButtons.ino on the DS side.
 */
 
 #include <Arduino.h>
@@ -335,14 +341,20 @@ static constexpr uint32_t PAD_REPEAT_INTERVAL_MS = 110;  // ...and every one aft
 // Plain digital inputs, so any free pin will do. These three avoid the
 // strapping pins (0, 3, 45, 46), the octal PSRAM's (33-37), and everything the
 // UART, USB, I2C, encoder, and joystick already hold.
+// Left to right the bar reads Start, B, A -- Start outermost like a Game Boy's
+// pair of pill buttons, and B left of A the way a Game Boy's face buttons sit,
+// so gameplay lands where a thumb expects. Pins ascend in that same order, so the
+// bar can be wired straight across. Get A and Start crossed and the symptom is
+// next and previous station (or track) swapping ends; the fix belongs here or in
+// the loom, never on the DOLL-OS side, which only ever sees the button names.
 #ifndef SLAVE_BUTTON_A_PIN
-#define SLAVE_BUTTON_A_PIN 10      // Left button: Game Boy A / Enter.
+#define SLAVE_BUTTON_A_PIN 12      // Right button: Game Boy A / next track-station.
 #endif
 #ifndef SLAVE_BUTTON_B_PIN
-#define SLAVE_BUTTON_B_PIN 11      // Middle button: Game Boy B / Escape.
+#define SLAVE_BUTTON_B_PIN 11      // Middle button: Game Boy B / pause-resume-stop.
 #endif
 #ifndef SLAVE_BUTTON_C_PIN
-#define SLAVE_BUTTON_C_PIN 12      // Right button: Game Boy Start / Enter.
+#define SLAVE_BUTTON_C_PIN 10      // Left button: Game Boy Start / previous track-station.
 #endif
 #endif
 
@@ -419,9 +431,14 @@ static uint8_t telnetPendingCommand = 0;
 static bool telnetSawCarriageReturn = false;
 static uint32_t lastStatusDisplayAt = 0;
 static uint32_t lastStatusDisplayHash = 0;
+// Terminate sits next to Game Mode because the two are the DS-facing pair: one
+// changes what input means, the other gets you out of whatever is consuming it.
+// It matters most on a build with no keyboard attached -- a bar-launched game or
+// a runaway .dapp would otherwise have no exit at all (see rotarySettingsApply).
 enum RotarySetting : uint8_t {
   ROTARY_SETTING_PAIR = 0,
   ROTARY_SETTING_GAME_MODE,
+  ROTARY_SETTING_TERMINATE,
   ROTARY_SETTING_RECONNECT,
   ROTARY_SETTING_SLEEP,
   ROTARY_SETTING_EXIT,
@@ -459,6 +476,7 @@ static void serviceJoystick();
 static const char *joystickStateName();
 static void buttonBarBegin();
 static void serviceButtonBar();
+static void buttonBarEmitLinkBytes(Peer &peer, uint32_t buttons);
 
 static uint8_t connectedPeerCount() {
   uint8_t count = 0;
@@ -937,23 +955,28 @@ static void updateStatusDisplay(bool force) {
              rotarySetting == ROTARY_SETTING_GAME_MODE ? '>' : ' ', gameMode ? "ON" : "OFF");
     statusDisplayDrawLine(2, line, rotarySetting == ROTARY_SETTING_GAME_MODE ? OLED_BLACK : OLED_WHITE,
                          rotarySetting == ROTARY_SETTING_GAME_MODE ? OLED_WHITE : OLED_BLACK);
+    snprintf(line, sizeof(line), "%c TERMINATE APP",
+             rotarySetting == ROTARY_SETTING_TERMINATE ? '>' : ' ');
+    statusDisplayDrawLine(3, line, rotarySetting == ROTARY_SETTING_TERMINATE ? OLED_BLACK : OLED_WHITE,
+                         rotarySetting == ROTARY_SETTING_TERMINATE ? OLED_WHITE : OLED_BLACK);
     snprintf(line, sizeof(line), "%c RECONNECT",
              rotarySetting == ROTARY_SETTING_RECONNECT ? '>' : ' ');
-    statusDisplayDrawLine(3, line, rotarySetting == ROTARY_SETTING_RECONNECT ? OLED_BLACK : OLED_WHITE,
+    statusDisplayDrawLine(4, line, rotarySetting == ROTARY_SETTING_RECONNECT ? OLED_BLACK : OLED_WHITE,
                          rotarySetting == ROTARY_SETTING_RECONNECT ? OLED_WHITE : OLED_BLACK);
     snprintf(line, sizeof(line), "%c SLEEP",
              rotarySetting == ROTARY_SETTING_SLEEP ? '>' : ' ');
-    statusDisplayDrawLine(4, line, rotarySetting == ROTARY_SETTING_SLEEP ? OLED_BLACK : OLED_WHITE,
+    statusDisplayDrawLine(5, line, rotarySetting == ROTARY_SETTING_SLEEP ? OLED_BLACK : OLED_WHITE,
                          rotarySetting == ROTARY_SETTING_SLEEP ? OLED_WHITE : OLED_BLACK);
     snprintf(line, sizeof(line), "%c EXIT",
              rotarySetting == ROTARY_SETTING_EXIT ? '>' : ' ');
-    statusDisplayDrawLine(5, line, rotarySetting == ROTARY_SETTING_EXIT ? OLED_BLACK : OLED_WHITE,
+    statusDisplayDrawLine(6, line, rotarySetting == ROTARY_SETTING_EXIT ? OLED_BLACK : OLED_WHITE,
                          rotarySetting == ROTARY_SETTING_EXIT ? OLED_WHITE : OLED_BLACK);
-    snprintf(line, sizeof(line), "BLE %u/%u USB %s",
-             connectedPeerCount(), MAX_PEERS, usbKeyboardConnected ? "ON" : "OFF");
-    statusDisplayDrawLine(6, line, connectedPeerCount() > 0 || usbKeyboardConnected ? OLED_GREEN : OLED_GRAY, OLED_BLACK);
+    //The sixth item claimed the row that used to repeat the BLE/USB counts. They are
+    //still one click away on the volume screen, and inside a menu the list is what
+    //the dial is actually for.
     const char *detail = rotarySetting == ROTARY_SETTING_PAIR ? "ADD BLE HID" :
                          rotarySetting == ROTARY_SETTING_GAME_MODE ? "TOGGLE INPUT MODE" :
+                         rotarySetting == ROTARY_SETTING_TERMINATE ? "QUIT APP TO SHELL" :
                          rotarySetting == ROTARY_SETTING_RECONNECT ? "SCAN SAVED DEVICES" :
                          rotarySetting == ROTARY_SETTING_SLEEP ? "LOW POWER MODE" :
                          "NO CHANGES";
@@ -1013,6 +1036,40 @@ static void linkWrite(const char *text) {
 
 static constexpr uint8_t LINK_SYSTEM_SLEEP = 0xF6;
 static constexpr uint8_t LINK_SYSTEM_WAKE = 0xF7;
+
+// Button-bar presses, one private byte per press edge, sent only while game mode
+// is off (in game mode the same switches are part of the merged Game Boy bitmap
+// instead). DOLL-OS decides what each one means from whatever is using its audio
+// and screen -- transport for the music player and the radio, app launchers on an
+// idle shell -- so the bar needs no notion of context itself. See PadButtons.ino
+// on the DS side; these four values are a paired protocol, flash both boards.
+static constexpr uint8_t LINK_PAD_START = 0xF8;
+static constexpr uint8_t LINK_PAD_SELECT = 0xF9;
+static constexpr uint8_t LINK_PAD_B = 0xFA;
+static constexpr uint8_t LINK_PAD_A = 0xFB;
+
+// The Settings > Terminate pair. Real control codes, not private bytes: DOLL-OS
+// already treats these as its two abort chords, so this reuses machinery every
+// modal screen over there has rather than asking for a new protocol byte. They
+// cover different apps -- ^X aborts a running .dapp and exits the editor, Ctrl+T
+// quits the Game Boy emulator, the music player, and an ssh/telnet session -- so
+// Terminate sends both. Order is deliberate: see sendAppTerminate().
+static constexpr uint8_t LINK_APP_ABORT = 0x18;   // ^X
+static constexpr uint8_t LINK_APP_QUIT = 0x14;    // Ctrl+T (DC4)
+
+// Ask DOLL-OS to close whatever app is on its panel and go back to the shell.
+//
+// ^X leads for a reason: a running .dapp's abort check *peeks* at the head of the
+// keyboard stream for it (appPollAbortChord, AppRunner.ino), and a Ctrl+T parked in
+// front would sit there unread until the script asked for a key -- which a runaway
+// script never does. With ^X first the dapp aborts immediately, and the Ctrl+T
+// behind it reaches whatever else was running. Every app that honours one ignores
+// the other, and with nothing running the DS line editor drops both, so a stray
+// Terminate at the shell prompt does nothing.
+static void sendAppTerminate() {
+  linkWrite(LINK_APP_ABORT);
+  linkWrite(LINK_APP_QUIT);
+}
 
 static void sendMainWakeBeacon() {
   // Several bytes cover the main unit's light-sleep wake latency; all are private controls.
@@ -1112,6 +1169,12 @@ static void rotarySettingsApply() {
     }
   } else if (selected == ROTARY_SETTING_GAME_MODE) {
     applyGameMode(!gameMode, "rotary settings");
+  } else if (selected == ROTARY_SETTING_TERMINATE) {
+    // Game mode is left alone on purpose: if the emulator is what quits, it sends
+    // its own "GAME 0" on the way out, and flipping the mode from this side first
+    // would change the byte vocabulary under the quit that is still in flight.
+    sendAppTerminate();
+    Serial.println("App terminate sent from rotary settings (^X + Ctrl+T)");
   } else if (selected == ROTARY_SETTING_RECONNECT) {
     NimBLEScan *scan = NimBLEDevice::getScan();
     if (scan->isScanning()) {
@@ -2088,6 +2151,12 @@ static void serviceGamepadRepeat() {
 // and needing two shoulders at once gives quitting the same "no single stray
 // press can do this" property Ctrl+T has on the keyboard. Pressing LB before RB
 // does open the menu on the way to quitting; the emulator is closing anyway.
+//
+// Outside game mode the button bar is the one input that does not send keystrokes:
+// its three switches exist to drive playback and launch apps, which is a job no
+// key sequence expresses, so they get their own private bytes (LINK_PAD_*). A
+// paired controller keeps sending Enter/Escape from its A/B, because a controller
+// is a general navigation device and losing those would cost more than it gains.
 static void padApplyState(Peer &peer) {
   const bool guide = (peer.padButtons & XB_GUIDE) != 0;
   if (guide && !peer.guidePrev) {
@@ -2104,6 +2173,11 @@ static void padApplyState(Peer &peer) {
     peer.gbQuit = bumperL && bumperR;
     peer.gbMenu = bumperL && !bumperR;
     emitMergedGamepadState();
+    return;
+  }
+
+  if (&peer == &buttonBarPeer) {
+    buttonBarEmitLinkBytes(peer, peer.padButtons);
     return;
   }
 
@@ -2326,11 +2400,12 @@ static void handleJoystickCommand(const String &args) {
 
 //   ---- Three-button bar ----------------------------------------------------
 //
-// Three momentary switches on a common rail: A, B, and Start, the Game Boy
-// buttons the joystick does not already cover. Like the joystick they are
-// decoded into pad bits and pushed through padApplyState(), so in game mode they
-// are the real A/B/Start and in the shell they are what the pad's A/B/Menu send
-// (Enter, Escape, Enter).
+// Three momentary switches on a common rail -- Start, B, A from left to right --
+// the Game Boy buttons the joystick does not already cover. Like the joystick they
+// are decoded into pad bits and pushed through padApplyState(), so in game mode
+// they are the real Start/B/A. Outside game mode they part company with every other
+// input: instead of keystrokes they send one private LINK_PAD_* byte per press, and
+// DOLL-OS turns that into transport or a launcher depending on what is running.
 //
 // The common rail is 3V3 and each switch closes onto its GPIO, so a pressed
 // button reads high and the pins idle low on the internal pulldowns. Wired the
@@ -2346,10 +2421,11 @@ struct ButtonBarKey {
   const char *label;
 };
 
+//listed left to right, which is also the order "BTN" prints them in
 static const ButtonBarKey buttonBarKeys[] = {
-  {SLAVE_BUTTON_A_PIN, XB_A,    "A"},
-  {SLAVE_BUTTON_B_PIN, XB_B,    "B"},
   {SLAVE_BUTTON_C_PIN, XB_MENU, "START"},
+  {SLAVE_BUTTON_B_PIN, XB_B,    "B"},
+  {SLAVE_BUTTON_A_PIN, XB_A,    "A"},
 };
 static constexpr uint8_t BUTTON_BAR_COUNT =
   sizeof(buttonBarKeys) / sizeof(buttonBarKeys[0]);
@@ -2357,6 +2433,35 @@ static constexpr uint8_t BUTTON_BAR_COUNT =
 static bool buttonBarRawPressed[BUTTON_BAR_COUNT];
 static bool buttonBarPressed[BUTTON_BAR_COUNT];
 static uint32_t buttonBarChangedAt[BUTTON_BAR_COUNT];
+
+// Keystroke mode: one private byte per press edge (see LINK_PAD_* above), which is
+// the whole reason the bar does not go through padEmitKeystrokes(). Nothing is sent
+// on release and nothing auto-repeats -- every action on the DS side is a one-shot,
+// so a held button is the same event as a tapped one. XB_VIEW is listed for the
+// build that adds a fourth switch as Select; the bar as wired never sets that bit
+// (the joystick's click carries Select, and keeps sending Escape in the shell).
+struct ButtonBarLinkByte {
+  uint32_t bit;
+  uint8_t byte;
+};
+
+static const ButtonBarLinkByte buttonBarLinkBytes[] = {
+  {XB_MENU, LINK_PAD_START},
+  {XB_VIEW, LINK_PAD_SELECT},
+  {XB_B,    LINK_PAD_B},
+  {XB_A,    LINK_PAD_A},
+};
+
+static void buttonBarEmitLinkBytes(Peer &peer, uint32_t buttons) {
+  const uint32_t pressed = buttons & ~peer.padPrevKeyButtons;
+  peer.padPrevKeyButtons = buttons;
+
+  for (const ButtonBarLinkByte &entry : buttonBarLinkBytes) {
+    if (pressed & entry.bit) {
+      linkWrite(entry.byte);
+    }
+  }
+}
 
 static bool buttonBarRead(uint8_t index) {
   const bool high = digitalRead(buttonBarKeys[index].pin) == HIGH;
@@ -2372,8 +2477,8 @@ static void buttonBarBegin() {
     buttonBarPressed[i] = buttonBarRawPressed[i];
     buttonBarChangedAt[i] = now;
   }
-  Serial.printf("Button bar enabled: A=%d B=%d START=%d active-%s\r\n",
-                SLAVE_BUTTON_A_PIN, SLAVE_BUTTON_B_PIN, SLAVE_BUTTON_C_PIN,
+  Serial.printf("Button bar enabled: START=%d B=%d A=%d active-%s\r\n",
+                SLAVE_BUTTON_C_PIN, SLAVE_BUTTON_B_PIN, SLAVE_BUTTON_A_PIN,
                 SLAVE_BUTTON_BAR_ACTIVE_LOW ? "low" : "high");
 }
 
@@ -2421,6 +2526,10 @@ static void handleButtonBarCommand() {
 #else
 static void buttonBarBegin() {}
 static void serviceButtonBar() {}
+static void buttonBarEmitLinkBytes(Peer &peer, uint32_t buttons) {
+  (void)peer;
+  (void)buttons;   // padApplyState still names it; buttonBarPeer just never gets state
+}
 static void handleButtonBarCommand() {
   Serial.println("Button bar support is compiled out (SLAVE_BUTTON_BAR_ENABLED 0)");
 }
@@ -3809,7 +3918,8 @@ static void handleCommand(String line, const char *source) {
     Serial.print(" joystick=");
     Serial.print(joystickStateName());
 #if SLAVE_BUTTON_BAR_ENABLED
-    Serial.printf(" buttons=%d/%d/%d", SLAVE_BUTTON_A_PIN, SLAVE_BUTTON_B_PIN, SLAVE_BUTTON_C_PIN);
+    //left to right, matching the boot banner and "BTN"
+    Serial.printf(" buttons=%d/%d/%d", SLAVE_BUTTON_C_PIN, SLAVE_BUTTON_B_PIN, SLAVE_BUTTON_A_PIN);
 #else
     Serial.print(" buttons=disabled");
 #endif
@@ -4202,7 +4312,8 @@ static void printCommandHelp() {
   Serial.println("Gamepad, GAME 1: dpad/stick, A/B, Menu=Start, View=Select, LB=menu, LB+RB=quit.");
   Serial.println("DUMP 1 hex-logs raw input reports here -- use it to check an unfamiliar pad's layout.");
   Serial.println("Joystick: axes send arrow keys (D-pad in GAME 1), stick click sends Select (Esc).");
-  Serial.println("Button bar: A, B, Start (Enter, Esc, Enter when not in GAME 1).");
+  Serial.println("Button bar, left to right: Start, B, A (GAME 1) / 0xF8, 0xFA, 0xFB private bytes (GAME 0).");
+  Serial.println("Those bytes are context controls on the DS: prev/pause/next for music+radio, else gb/radio/music.");
 }
 
 void setup() {
