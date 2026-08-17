@@ -10,7 +10,7 @@
 // module reads depends on how it is soldered and which way it is glued into the
 // case, so it is a build option rather than something the sketch can know.
 // "JOY" on the console prints the live axis values while you push the stick.
-#define SLAVE_JOYSTICK_INVERT_X 0
+#define SLAVE_JOYSTICK_INVERT_X 1
 #define SLAVE_JOYSTICK_INVERT_Y 0
 
 // Button bar wiring. 0 = the bar's common rail is 3V3 and each switch closes
