@@ -51,6 +51,22 @@
     GPIO5 = encoder shaft push-button signal / SW
     GPIO6 = encoder rotation clock / channel A / CLK
     GPIO7 = encoder rotation data / channel B / DT
+
+  Optional analog thumb joystick (KY-023 and friends):
+    GND = power/signal ground
+    +5V/VCC = 3V3 power (the module is a pair of pots; 3V3 keeps the wipers
+              inside the ADC's range -- never 5 V)
+    VRx = GPIO1 analog X axis
+    VRy = GPIO2 analog Y axis
+    SW  = GPIO4 push-button signal, active low
+  It drives the same signals the arrow keys do: CSI arrows in keystroke mode,
+  D-pad button events in game mode. Clicking the stick is Select (Escape when
+  not in game mode), the same as the pad's View button.
+
+  Optional three-button bar, common rail to 3V3, one switch per pin:
+    GPIO10 = A     (Enter when not in game mode)
+    GPIO11 = B     (Escape)
+    GPIO12 = Start (Enter)
 */
 
 #include <Arduino.h>
@@ -293,6 +309,43 @@ static constexpr uint32_t PAD_REPEAT_INTERVAL_MS = 110;  // ...and every one aft
 #endif
 #endif
 
+#ifndef SLAVE_JOYSTICK_ENABLED
+#define SLAVE_JOYSTICK_ENABLED 1
+#endif
+
+#if SLAVE_JOYSTICK_ENABLED
+// Both axes must sit on ADC1 (GPIO1-10 on the S3): ADC2 is owned by the radio
+// while WiFi is up, and this sketch keeps WiFi up for Telnet.
+#ifndef SLAVE_JOYSTICK_X_PIN
+#define SLAVE_JOYSTICK_X_PIN 1     // Joystick VRx / analog X axis.
+#endif
+#ifndef SLAVE_JOYSTICK_Y_PIN
+#define SLAVE_JOYSTICK_Y_PIN 2     // Joystick VRy / analog Y axis.
+#endif
+#ifndef SLAVE_JOYSTICK_BUTTON_PIN
+#define SLAVE_JOYSTICK_BUTTON_PIN 4  // Joystick SW / stick push-button signal.
+#endif
+#endif
+
+#ifndef SLAVE_BUTTON_BAR_ENABLED
+#define SLAVE_BUTTON_BAR_ENABLED 1
+#endif
+
+#if SLAVE_BUTTON_BAR_ENABLED
+// Plain digital inputs, so any free pin will do. These three avoid the
+// strapping pins (0, 3, 45, 46), the octal PSRAM's (33-37), and everything the
+// UART, USB, I2C, encoder, and joystick already hold.
+#ifndef SLAVE_BUTTON_A_PIN
+#define SLAVE_BUTTON_A_PIN 10      // Left button: Game Boy A / Enter.
+#endif
+#ifndef SLAVE_BUTTON_B_PIN
+#define SLAVE_BUTTON_B_PIN 11      // Middle button: Game Boy B / Escape.
+#endif
+#ifndef SLAVE_BUTTON_C_PIN
+#define SLAVE_BUTTON_C_PIN 12      // Right button: Game Boy Start / Enter.
+#endif
+#endif
+
 static const NimBLEUUID HID_SERVICE_UUID((uint16_t)0x1812);
 static const NimBLEUUID REPORT_UUID((uint16_t)0x2A4D);
 static const NimBLEUUID REPORT_REF_UUID((uint16_t)0x2908);
@@ -309,6 +362,19 @@ WiFiClient telnetClient;
 static Peer peers[MAX_PEERS];
 static Peer usbKeyboardPeer;
 static volatile bool usbKeyboardConnected = false;
+
+// The analog joystick is not a HID device, but it produces exactly what a pad's
+// left stick produces, so it borrows a Peer to hold that state and then goes
+// through the same padApplyState() path. That way it inherits the direction
+// hysteresis, the keystroke auto-repeat, and the merged game-mode bitmap for
+// free, and nothing downstream has to learn that a third input exists.
+static Peer joystickPeer;
+static volatile bool joystickPresent = false;
+
+// Same trick for the three-button bar: its own Peer, so its buttons merge with
+// everything else's instead of overwriting them, and it reaches the DS through
+// the one path every other input already uses.
+static Peer buttonBarPeer;
 
 // True while a connection is being established. Only one can be in flight at a
 // time: the radio can only initiate one, and the scanner has to be stopped while
@@ -388,6 +454,11 @@ static void statusDisplayRefresh();
 static void statusDisplayPowerOff();
 static void rotaryEncoderBegin();
 static void serviceRotaryEncoder();
+static void joystickBegin();
+static void serviceJoystick();
+static const char *joystickStateName();
+static void buttonBarBegin();
+static void serviceButtonBar();
 
 static uint8_t connectedPeerCount() {
   uint8_t count = 0;
@@ -1676,6 +1747,10 @@ static void emitMergedGamepadState() {
     quit = quit || usbKeyboardPeer.gbQuit;
     menu = menu || usbKeyboardPeer.gbMenu;
   }
+  if (joystickPresent) {
+    mask |= joystickPeer.gbMask;
+  }
+  mask |= buttonBarPeer.gbMask;
 
   const uint8_t down = mask & ~gamepadPrev;
   const uint8_t up = gamepadPrev & ~mask;
@@ -1740,6 +1815,13 @@ static void applyGameMode(bool on, const char *reason) {
   clearPeerGameState(usbKeyboardPeer);
   memset(usbKeyboardPeer.lastKeys, 0, sizeof(usbKeyboardPeer.lastKeys));
   usbKeyboardPeer.f12Prev = false;
+
+  clearPeerGameState(joystickPeer);
+  joystickPeer.padPrevKeyButtons = 0;
+  joystickPeer.padRepeatBit = 0;
+
+  clearPeerGameState(buttonBarPeer);
+  buttonBarPeer.padPrevKeyButtons = 0;
 
   if (on != wasOn && wasOn) {
     emitMergedGamepadState();   // every mask is zero now: releases the lot
@@ -1956,33 +2038,42 @@ static void padEmitKeystrokes(Peer &peer, uint32_t buttons) {
   }
 }
 
+// One input's share of the keystroke auto-repeat. Split out from the loop below
+// because the analog joystick needs the same treatment but is not in peers[].
+static void servicePeerRepeat(Peer &peer) {
+  if (peer.padRepeatBit == 0) {
+    return;
+  }
+
+  if ((peer.padButtons & peer.padRepeatBit) == 0) {   // released without us noticing
+    peer.padRepeatBit = 0;
+    return;
+  }
+
+  if (int32_t(millis() - peer.padRepeatAt) < 0) {
+    return;
+  }
+
+  const PadKeyBinding *binding = padBindingFor(peer.padRepeatBit);
+  if (binding == nullptr) {
+    peer.padRepeatBit = 0;
+    return;
+  }
+
+  linkWrite(binding->sequence);
+  peer.padRepeatAt = millis() + PAD_REPEAT_INTERVAL_MS;
+}
+
 static void serviceGamepadRepeat() {
   if (gameMode) {
     return;
   }
 
   for (Peer &peer : peers) {
-    if (!peer.connected || peer.padRepeatBit == 0) {
+    if (!peer.connected) {
       continue;
     }
-
-    if ((peer.padButtons & peer.padRepeatBit) == 0) {   // released without us noticing
-      peer.padRepeatBit = 0;
-      continue;
-    }
-
-    if (int32_t(millis() - peer.padRepeatAt) < 0) {
-      continue;
-    }
-
-    const PadKeyBinding *binding = padBindingFor(peer.padRepeatBit);
-    if (binding == nullptr) {
-      peer.padRepeatBit = 0;
-      continue;
-    }
-
-    linkWrite(binding->sequence);
-    peer.padRepeatAt = millis() + PAD_REPEAT_INTERVAL_MS;
+    servicePeerRepeat(peer);
   }
 }
 
@@ -2018,6 +2109,322 @@ static void padApplyState(Peer &peer) {
 
   padEmitKeystrokes(peer, peer.padButtons);
 }
+
+//   ---- Analog thumb joystick ----------------------------------------------
+//
+// A KY-023-style module: two potentiometers wired as dividers across 3V3 and a
+// momentary switch to ground. Its axes are decoded into the same XB_UP/DOWN/
+// LEFT/RIGHT bits an Xbox stick produces and handed to padApplyState(), so it
+// sends exactly what the arrow keys send -- CSI arrow sequences in keystroke
+// mode, Game Boy D-pad events in game mode -- with the same hysteresis and
+// auto-repeat. The stick's push-button rides along as XB_VIEW, the pad's Select:
+// the Game Boy's Select button in game mode, Escape in keystroke mode, which is
+// where the pad's View button already goes.
+#if SLAVE_JOYSTICK_ENABLED
+
+static constexpr uint32_t JOYSTICK_SAMPLE_INTERVAL_MS = 10;
+static constexpr uint32_t JOYSTICK_BUTTON_DEBOUNCE_MS = 25;
+static constexpr uint8_t JOYSTICK_CALIBRATION_SAMPLES = 32;
+// ADC counts (12-bit) scaled onto the +/-32768 range padAxisHeld() thresholds
+// against, so both sticks share one set of on/off thresholds. Half of the ADC's
+// span is 2048 counts, and 2048 * 16 = 32768.
+static constexpr int32_t JOYSTICK_SCALE = 16;
+// A wired-up module rests near mid-scale and is quiet. An unconnected ADC pin
+// floats: it reads at one of the rails, or wanders. Either would look like a
+// direction being held forever, so an implausible rest position means "no
+// joystick" rather than a stuck arrow key. "JOY 1" overrides the verdict.
+static constexpr uint16_t JOYSTICK_CENTER_MIN = 1000;
+static constexpr uint16_t JOYSTICK_CENTER_MAX = 3100;
+static constexpr uint16_t JOYSTICK_MAX_REST_JITTER = 220;
+
+static uint16_t joystickCenterX = 2048;
+static uint16_t joystickCenterY = 2048;
+static uint16_t joystickRawX = 0;
+static uint16_t joystickRawY = 0;
+static uint16_t joystickRestJitter = 0;
+static bool joystickForced = false;   // "JOY 1": trust the wiring over the probe
+static uint32_t nextJoystickSampleAt = 0;
+static bool joystickButtonRawPressed = false;
+static bool joystickButtonPressed = false;
+static uint32_t joystickButtonChangedAt = 0;
+
+// Average of a short burst, with the spread reported alongside: the mean is the
+// centre to measure deflection from, the spread is how we tell a resting stick
+// from a floating pin.
+static uint16_t joystickSampleAxis(int pin, uint16_t &spread) {
+  uint32_t total = 0;
+  uint16_t lowest = 4095;
+  uint16_t highest = 0;
+  for (uint8_t i = 0; i < JOYSTICK_CALIBRATION_SAMPLES; i++) {
+    const uint16_t sample = analogRead(pin);
+    total += sample;
+    if (sample < lowest) lowest = sample;
+    if (sample > highest) highest = sample;
+    delay(1);
+  }
+  spread = highest - lowest;
+  return uint16_t(total / JOYSTICK_CALIBRATION_SAMPLES);
+}
+
+// Re-reads the resting position. Nothing may be touching the stick while this
+// runs -- wherever it is held becomes the new centre.
+static bool joystickCalibrate() {
+  uint16_t spreadX = 0;
+  uint16_t spreadY = 0;
+  joystickCenterX = joystickSampleAxis(SLAVE_JOYSTICK_X_PIN, spreadX);
+  joystickCenterY = joystickSampleAxis(SLAVE_JOYSTICK_Y_PIN, spreadY);
+  joystickRawX = joystickCenterX;
+  joystickRawY = joystickCenterY;
+  joystickRestJitter = spreadX > spreadY ? spreadX : spreadY;
+
+  const bool plausible =
+    joystickCenterX >= JOYSTICK_CENTER_MIN && joystickCenterX <= JOYSTICK_CENTER_MAX &&
+    joystickCenterY >= JOYSTICK_CENTER_MIN && joystickCenterY <= JOYSTICK_CENTER_MAX &&
+    joystickRestJitter <= JOYSTICK_MAX_REST_JITTER;
+  return plausible || joystickForced;
+}
+
+// Drops whatever the joystick was holding. Used when it is switched off, so the
+// DS is not left with a button down that nothing will ever release.
+static void joystickReleaseAll() {
+  joystickPeer.padButtons = 0;
+  joystickPeer.padRepeatBit = 0;
+  if (gameMode) {
+    joystickPeer.gbMask = 0;
+    emitMergedGamepadState();
+  } else {
+    joystickPeer.padPrevKeyButtons = 0;
+  }
+}
+
+static void joystickBegin() {
+  analogReadResolution(12);
+  analogSetPinAttenuation(SLAVE_JOYSTICK_X_PIN, ADC_11db);   // full 0-3V3 swing
+  analogSetPinAttenuation(SLAVE_JOYSTICK_Y_PIN, ADC_11db);
+  pinMode(SLAVE_JOYSTICK_BUTTON_PIN, INPUT_PULLUP);
+  joystickButtonRawPressed = digitalRead(SLAVE_JOYSTICK_BUTTON_PIN) == LOW;
+  joystickButtonPressed = joystickButtonRawPressed;
+  joystickButtonChangedAt = millis();
+
+  joystickPresent = joystickCalibrate();
+  Serial.printf("Joystick X=%d Y=%d SW=%d: %s (centre %u/%u jitter %u)\r\n",
+                SLAVE_JOYSTICK_X_PIN, SLAVE_JOYSTICK_Y_PIN, SLAVE_JOYSTICK_BUTTON_PIN,
+                joystickPresent ? "detected" : "not detected (pins float; use JOY 1 to force)",
+                joystickCenterX, joystickCenterY, joystickRestJitter);
+}
+
+static uint32_t joystickReadDirections() {
+  joystickRawX = analogRead(SLAVE_JOYSTICK_X_PIN);
+  joystickRawY = analogRead(SLAVE_JOYSTICK_Y_PIN);
+
+  int32_t x = (int32_t(joystickRawX) - int32_t(joystickCenterX)) * JOYSTICK_SCALE;
+  int32_t y = (int32_t(joystickRawY) - int32_t(joystickCenterY)) * JOYSTICK_SCALE;
+  if (SLAVE_JOYSTICK_INVERT_X) x = -x;
+  if (SLAVE_JOYSTICK_INVERT_Y) y = -y;
+
+  // Rising X is right and rising Y is up, before the invert flags above. Which
+  // way a given module is soldered and which way round it is glued into the case
+  // both change that, so the flags live in BoardVariant.h next to the encoder's.
+  const uint32_t previous = joystickPeer.padButtons;
+  uint32_t next = 0;
+  if (padAxisHeld(-x, previous & XB_LEFT))  next |= XB_LEFT;
+  if (padAxisHeld(x,  previous & XB_RIGHT)) next |= XB_RIGHT;
+  if (padAxisHeld(y,  previous & XB_UP))    next |= XB_UP;
+  if (padAxisHeld(-y, previous & XB_DOWN))  next |= XB_DOWN;
+  return next;
+}
+
+// Debounced, and reported as a level rather than an edge: padApplyState wants
+// the whole "what is held now" bitmap, and game mode needs the release too.
+static bool joystickButtonHeld() {
+  const bool rawPressed = digitalRead(SLAVE_JOYSTICK_BUTTON_PIN) == LOW;
+  const uint32_t now = millis();
+  if (rawPressed != joystickButtonRawPressed) {
+    joystickButtonRawPressed = rawPressed;
+    joystickButtonChangedAt = now;
+  }
+  if (rawPressed != joystickButtonPressed &&
+      uint32_t(now - joystickButtonChangedAt) >= JOYSTICK_BUTTON_DEBOUNCE_MS) {
+    joystickButtonPressed = rawPressed;
+  }
+  return joystickButtonPressed;
+}
+
+static void serviceJoystick() {
+  if (!joystickPresent) {
+    return;
+  }
+
+  // The ADC is polled on a fixed tick rather than every loop pass: at 10 ms a
+  // held direction still repeats on time, and the reads stay out of the way of
+  // the BLE work loop() is really here to do.
+  const uint32_t now = millis();
+  if (int32_t(now - nextJoystickSampleAt) >= 0) {
+    nextJoystickSampleAt = now + JOYSTICK_SAMPLE_INTERVAL_MS;
+
+    uint32_t buttons = joystickReadDirections();
+    if (joystickButtonHeld()) {
+      buttons |= XB_VIEW;
+    }
+
+    if (buttons != joystickPeer.padButtons) {
+      joystickPeer.padButtons = buttons;
+      padApplyState(joystickPeer);
+    }
+  }
+
+  if (!gameMode) {
+    servicePeerRepeat(joystickPeer);
+  }
+}
+
+static const char *joystickStateName() {
+  return joystickPresent ? (joystickForced ? "forced" : "ready") : "absent";
+}
+
+// "JOY", "JOY CAL", "JOY 0|1" -- report, recentre, or overrule the probe.
+static void handleJoystickCommand(const String &args) {
+  if (args == "0") {
+    joystickForced = false;
+    if (joystickPresent) {
+      joystickPresent = false;
+      joystickReleaseAll();
+    }
+    Serial.println("Joystick disabled");
+    return;
+  }
+
+  if (args == "1" || args == "CAL" || args == "CALIBRATE" || args.length() == 0) {
+    if (args == "1") {
+      joystickForced = true;
+    }
+    if (args.length() > 0) {
+      joystickPresent = joystickCalibrate();
+    }
+  } else {
+    Serial.println("Usage: JOY [CAL|0|1]");
+    return;
+  }
+
+  Serial.printf("Joystick %s: x=%u y=%u centre=%u/%u jitter=%u button=%s\r\n",
+                joystickStateName(), joystickRawX, joystickRawY,
+                joystickCenterX, joystickCenterY, joystickRestJitter,
+                joystickButtonPressed ? "down" : "up");
+}
+
+#else
+static void joystickBegin() {}
+static void serviceJoystick() {}
+static const char *joystickStateName() {
+  return "disabled";
+}
+static void handleJoystickCommand(const String &args) {
+  (void)args;
+  Serial.println("Joystick support is compiled out (SLAVE_JOYSTICK_ENABLED 0)");
+}
+#endif
+
+//   ---- Three-button bar ----------------------------------------------------
+//
+// Three momentary switches on a common rail: A, B, and Start, the Game Boy
+// buttons the joystick does not already cover. Like the joystick they are
+// decoded into pad bits and pushed through padApplyState(), so in game mode they
+// are the real A/B/Start and in the shell they are what the pad's A/B/Menu send
+// (Enter, Escape, Enter).
+//
+// The common rail is 3V3 and each switch closes onto its GPIO, so a pressed
+// button reads high and the pins idle low on the internal pulldowns. Wired the
+// other way -- common to GND, switches pulling the pin down -- set
+// SLAVE_BUTTON_BAR_ACTIVE_LOW to 1 and the pins idle high on pullups instead.
+#if SLAVE_BUTTON_BAR_ENABLED
+
+static constexpr uint32_t BUTTON_BAR_DEBOUNCE_MS = 25;
+
+struct ButtonBarKey {
+  uint8_t pin;
+  uint32_t bit;
+  const char *label;
+};
+
+static const ButtonBarKey buttonBarKeys[] = {
+  {SLAVE_BUTTON_A_PIN, XB_A,    "A"},
+  {SLAVE_BUTTON_B_PIN, XB_B,    "B"},
+  {SLAVE_BUTTON_C_PIN, XB_MENU, "START"},
+};
+static constexpr uint8_t BUTTON_BAR_COUNT =
+  sizeof(buttonBarKeys) / sizeof(buttonBarKeys[0]);
+
+static bool buttonBarRawPressed[BUTTON_BAR_COUNT];
+static bool buttonBarPressed[BUTTON_BAR_COUNT];
+static uint32_t buttonBarChangedAt[BUTTON_BAR_COUNT];
+
+static bool buttonBarRead(uint8_t index) {
+  const bool high = digitalRead(buttonBarKeys[index].pin) == HIGH;
+  return SLAVE_BUTTON_BAR_ACTIVE_LOW ? !high : high;
+}
+
+static void buttonBarBegin() {
+  const uint32_t now = millis();
+  for (uint8_t i = 0; i < BUTTON_BAR_COUNT; i++) {
+    pinMode(buttonBarKeys[i].pin,
+            SLAVE_BUTTON_BAR_ACTIVE_LOW ? INPUT_PULLUP : INPUT_PULLDOWN);
+    buttonBarRawPressed[i] = buttonBarRead(i);
+    buttonBarPressed[i] = buttonBarRawPressed[i];
+    buttonBarChangedAt[i] = now;
+  }
+  Serial.printf("Button bar enabled: A=%d B=%d START=%d active-%s\r\n",
+                SLAVE_BUTTON_A_PIN, SLAVE_BUTTON_B_PIN, SLAVE_BUTTON_C_PIN,
+                SLAVE_BUTTON_BAR_ACTIVE_LOW ? "low" : "high");
+}
+
+static void serviceButtonBar() {
+  const uint32_t now = millis();
+  uint32_t buttons = 0;
+
+  for (uint8_t i = 0; i < BUTTON_BAR_COUNT; i++) {
+    const bool rawPressed = buttonBarRead(i);
+    if (rawPressed != buttonBarRawPressed[i]) {
+      buttonBarRawPressed[i] = rawPressed;
+      buttonBarChangedAt[i] = now;
+    }
+    if (rawPressed != buttonBarPressed[i] &&
+        uint32_t(now - buttonBarChangedAt[i]) >= BUTTON_BAR_DEBOUNCE_MS) {
+      buttonBarPressed[i] = rawPressed;
+    }
+    if (buttonBarPressed[i]) {
+      buttons |= buttonBarKeys[i].bit;
+    }
+  }
+
+  // None of A/B/Start auto-repeats, so unlike the joystick there is no repeat to
+  // service here -- an edge either way is the whole of the state change.
+  if (buttons != buttonBarPeer.padButtons) {
+    buttonBarPeer.padButtons = buttons;
+    padApplyState(buttonBarPeer);
+  }
+}
+
+// "BTN" -- raw pin levels and the decoded press state, for checking which way
+// round the bar is wired without having to guess from behaviour.
+static void handleButtonBarCommand() {
+  Serial.print("Button bar active-");
+  Serial.print(SLAVE_BUTTON_BAR_ACTIVE_LOW ? "low:" : "high:");
+  for (uint8_t i = 0; i < BUTTON_BAR_COUNT; i++) {
+    Serial.printf(" %s(GPIO%u)=%s/%s", buttonBarKeys[i].label,
+                  unsigned(buttonBarKeys[i].pin),
+                  digitalRead(buttonBarKeys[i].pin) == HIGH ? "high" : "low",
+                  buttonBarPressed[i] ? "down" : "up");
+  }
+  Serial.println();
+}
+
+#else
+static void buttonBarBegin() {}
+static void serviceButtonBar() {}
+static void handleButtonBarCommand() {
+  Serial.println("Button bar support is compiled out (SLAVE_BUTTON_BAR_ENABLED 0)");
+}
+#endif
 
 static void handleGamepadInputReport(Peer &peer, uint8_t reportId, const uint8_t *data, size_t length) {
   if (reportId == 2) {
@@ -3399,6 +3806,13 @@ static void handleCommand(String line, const char *source) {
 #else
     Serial.print("disabled");
 #endif
+    Serial.print(" joystick=");
+    Serial.print(joystickStateName());
+#if SLAVE_BUTTON_BAR_ENABLED
+    Serial.printf(" buttons=%d/%d/%d", SLAVE_BUTTON_A_PIN, SLAVE_BUTTON_B_PIN, SLAVE_BUTTON_C_PIN);
+#else
+    Serial.print(" buttons=disabled");
+#endif
     Serial.print(" wifi=");
     Serial.print(WiFi.status() == WL_CONNECTED ? "connected" : "disconnected");
     if (WiFi.status() == WL_CONNECTED) {
@@ -3470,6 +3884,12 @@ static void handleCommand(String line, const char *source) {
       Serial.print("Input report hex dump ");
       Serial.println(reportDump ? "on" : "off");
     }
+  } else if (command == "JOY") {
+    String joyArgs = args;
+    joyArgs.toUpperCase();
+    handleJoystickCommand(joyArgs);
+  } else if (command == "BTN" || command == "BUTTONS") {
+    handleButtonBarCommand();
   } else {
     Serial.print("Unknown command: ");
     Serial.println(command);
@@ -3771,6 +4191,8 @@ static void printCommandHelp() {
   Serial.println("  GAME 0|1");
   Serial.println("  PAD [slot] AUTO|KEYBOARD|GAMEPAD");
   Serial.println("  DUMP 0|1");
+  Serial.println("  JOY [CAL|0|1]     analog joystick: report, recentre, or force off/on");
+  Serial.println("  BTN               button bar: raw pin levels and press state");
   Serial.printf("Up to %u devices at once (a keyboard and a controller); STATUS lists the slots.\r\n",
                 MAX_PEERS);
   Serial.println("Modifiers: Ctrl sends control bytes where possible, Alt prefixes ESC, Cmd uses CSI-u.");
@@ -3779,6 +4201,8 @@ static void printCommandHelp() {
   Serial.println("Gamepad, GAME 0: dpad/stick=arrows A=Enter B=Esc X=Bksp Y=Tab LB/RB=PgUp/PgDn RT=Space.");
   Serial.println("Gamepad, GAME 1: dpad/stick, A/B, Menu=Start, View=Select, LB=menu, LB+RB=quit.");
   Serial.println("DUMP 1 hex-logs raw input reports here -- use it to check an unfamiliar pad's layout.");
+  Serial.println("Joystick: axes send arrow keys (D-pad in GAME 1), stick click sends Select (Esc).");
+  Serial.println("Button bar: A, B, Start (Enter, Esc, Enter when not in GAME 1).");
 }
 
 void setup() {
@@ -3799,6 +4223,8 @@ void setup() {
   Serial.printf("Serial0 mirror baud=%lu\r\n", (unsigned long)SERIAL0_MIRROR_BAUD);
   Serial.printf("Status WS2812 pin=%d brightness=%u\r\n", STATUS_LED_PIN, STATUS_LED_BRIGHTNESS);
   rotaryEncoderBegin();
+  joystickBegin();
+  buttonBarBegin();
   statusDisplayBegin();
 
   usbKeyboardHostBegin();
@@ -3843,6 +4269,8 @@ void loop() {
   servicePendingLedMaskWrite();
   serviceGamepadRepeat();
   serviceRotaryEncoder();
+  serviceJoystick();
+  serviceButtonBar();
   updateStatusLed();
   updateStatusDisplay(false);
 
