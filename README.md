@@ -161,9 +161,15 @@ it against whatever is currently using its audio and screen:
 
 | What's running on the DS | Start (left) | B (middle) | A (right) |
 |---|---|---|---|
-| Music player open, or a library track playing | previous track | pause / resume | next track |
+| Music player open | previous track | select (Enter) | next track |
+| A library track playing, player closed | previous track | pause / resume | next track |
 | A radio stream loaded | previous station | stop | next station |
 | Nothing playing — plain shell | launch `gb` | launch `radio play` | launch `music` |
+
+Select is what makes the browser usable with no keyboard: it descends the music
+player's root → artists → albums → tracks and plays the highlighted track, while the
+joystick's click sends Escape to come back up. On the row that is already playing —
+where entering would only restart it — B is pause / resume instead.
 
 The middle button stops the radio rather than pausing it, because a paused stream still
 owns the bar and would leave the `gb` and `music` launchers unreachable. Stopping

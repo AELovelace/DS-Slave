@@ -71,7 +71,8 @@
   In game mode these are the real Game Boy Start/B/A. Outside it they are the
   only input that does not send keystrokes: each press sends one private byte
   (0xF8 Start, 0xFA B, 0xFB A) and DOLL-OS reads it against whatever is running --
-  previous/pause/next for the music player and the radio, or gb/radio/music
+  previous/next either side of B, where B is select in the open music player,
+  pause for a background track, stop for a stream, or the gb/radio/music
   launchers on an idle shell. See PadButtons.ino on the DS side.
 */
 
